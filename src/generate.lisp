@@ -27,9 +27,10 @@
   (prompts (make-hash-table :test 'equal)))   ; prompt -> (states . p), the last few
 
 (defun load-engine (&key (dit "/dev/shm/exn/dit-q8_0.gguf") (vae "/dev/shm/exn/vae.safetensors")
-                         (encoder "/dev/shm/exn/te-q8_0.gguf") (device 0))
-  "The three models: the encoder on the CPU, the DiT and decoder on CUDA device DEVICE."
-  (%make-engine :encoder (load-encoder encoder) :dit (upload-dit dit :device device)
+                         (encoder "/dev/shm/exn/te-q8_0.gguf") (device 0) (encoder-device 1))
+  "The three models: the DiT and decoder on CUDA device DEVICE, the encoder
+   on ENCODER-DEVICE (NIL: the CPU)."
+  (%make-engine :encoder (load-encoder encoder :device encoder-device) :dit (upload-dit dit :device device)
                 :vae (upload-vae vae :device device)))
 
 (defun gaussian-noise (n seed)

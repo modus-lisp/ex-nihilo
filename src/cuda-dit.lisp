@@ -96,13 +96,23 @@
                (car (setf (gethash key (gdit-buf d))
                           (cons (il::cuda-alloc (gdit-dev d) (* 4 floats) :zero nil) floats)))))))
 
+(defvar *int8* t
+  "Whether many rows through a Q8_0 matrix go as int8 activations (illatio's
+   MM_Q8_MMA2: X quantized to Q8_0 by blocks of 32, the int8 tensor cores --
+   ggml's way for a batch) rather than as halves (D4_MM_Q8_0).")
+
 (defun mm (d name x y n)
   "Y (N rows) = W X (N rows) for D's matrix NAME, whatever its format."
   (destructuring-bind (kind a b &optional c e) (or (gethash name (gdit-w d)) (error "no matrix ~A" name))
     (let ((dev (gdit-dev d)))
       (ecase kind
-        (:q8 (il::launch dev "d4_mm_q8_0" (list (ceiling n 64) (ceiling c 64)) 128
-                         (list e c n 0 e c a b x y)))
+        (:q8 (if (and *int8* (>= n 16) (il::mm2-p dev e))
+                 (let* ((blocks (floor (* n e) 32))
+                        (xq (scratch d :xq (ceiling (* n e) 4))) (xs (scratch d :xs blocks)))
+                   (il::launch dev "quant_q8" (ceiling blocks 8) 256 (list x xq xs nil (list :i64 blocks)))
+                   (il::cmat-mul dev (il::%make-cmat :name name :type :q8_0 :rows c :cols e :qs a :d b) xq xs y n))
+                 (il::launch dev "d4_mm_q8_0" (list (ceiling n 64) (ceiling c 64)) 128
+                             (list e c n 0 e c a b x y))))
         (:bf16 (il::launch dev "g53_mm_bf16" (list (ceiling n 64) (ceiling b 64)) 256
                            (list c b n c b a x y)))
         (:f32 (il::launch dev "d41_mm_f32" (list (ceiling n 64) (ceiling b 64)) 256
