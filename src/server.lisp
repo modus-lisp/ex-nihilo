@@ -178,7 +178,8 @@ $('go').onclick=go; $('p').onkeydown=e=>{if(e.key==='Enter'&&(e.metaKey||e.ctrlK
 (defun main (args)
   "bin/ex-nihilo: [--host H] [--port P] [--weights DIR] [--device N] [--encoder-device N|cpu]"
   (let ((host "127.0.0.1") (port 9940) (dir "/dev/shm/exn/") (device 0) (encoder-device 1))
-    (loop while args
+    (handler-case
+     (loop while args
           do (let ((flag (pop args)) (v (pop args)))
                (unless v (error "~A wants a value" flag))
                (cond ((string= flag "--host") (setf host v))
@@ -188,6 +189,9 @@ $('go').onclick=go; $('p').onkeydown=e=>{if(e.key==='Enter'&&(e.metaKey||e.ctrlK
                      ((string= flag "--encoder-device")
                       (setf encoder-device (if (string-equal v "cpu") nil (parse-integer v))))
                      (t (error "unknown flag ~A" flag)))))
+      (error (e)
+        (format *error-output* "ex-nihilo: ~A~%usage: bin/ex-nihilo [--host H] [--port 9940] [--weights DIR] [--device N] [--encoder-device N|cpu]~%" e)
+        (uiop:quit 2)))
     (let ((e (load-engine :dit (namestring (merge-pathnames "dit-q8_0.gguf" dir))
                           :vae (namestring (merge-pathnames "vae.safetensors" dir))
                           :encoder (namestring (merge-pathnames "te-q8_0.gguf" dir))

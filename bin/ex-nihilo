@@ -7,4 +7,4 @@ exec "${EXN_SBCL:-sbcl}" --dynamic-space-size "${EXN_HEAP_MB:-16384}" --noinform
   --eval '(require :asdf)' \
   --eval "(asdf:initialize-source-registry '(:source-registry (:tree \"$ROOT/../\") :inherit-configuration))" \
   --eval '(handler-bind ((warning (function muffle-warning))) (asdf:load-system "ex-nihilo/server"))' \
-  --eval '(ex-nihilo:main (rest (member "--end-toplevel-options" sb-ext:*posix-argv* :test (function string=))))' --end-toplevel-options "$@"
+  --eval '(ex-nihilo:main (rest sb-ext:*posix-argv*))' --end-toplevel-options "$@"
