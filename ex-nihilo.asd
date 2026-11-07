@@ -20,3 +20,8 @@
      (:file "cuda-dit" :if-feature (:and :sbcl :linux))   ; the DiT on an NVIDIA GPU (kernels: src/cuda/)
      (:file "cuda-vae" :if-feature (:and :sbcl :linux))   ; the decoder there
      (:file "generate")))))  ; noise, eight steps, the decoder: a PNG
+
+(defsystem "ex-nihilo/server"
+  :description "OpenAI's image API: POST /v1/images/generations, and a page to try it."
+  :depends-on ("ex-nihilo" "illatio/server")
+  :components ((:module "src" :components ((:file "server")))))
