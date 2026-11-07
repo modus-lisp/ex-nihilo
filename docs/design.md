@@ -9,8 +9,9 @@ These notes come from stable-diffusion.cpp's implementation, read at
 - `src/model/vae/wan_vae.hpp`, the decoder
 - `src/runtime/denoiser.hpp`, the schedule
 
-The configs are the HF repos' own. Details still to confirm against a
-reference are marked **(check)**.
+The configs are the HF repos' own. The details first marked **(check)** are
+now settled. Each is noted where it appears, with the source that settled
+it.
 
 ## One picture, end to end
 
@@ -68,7 +69,7 @@ There are no biases anywhere. The tensor names below are diffusers'
 - **`txt_in`** projects the prompt:
   1. a zero-centred RMSNorm, whose weight is used as 1 + w;
   2. a 4096→4096 linear;
-  3. GELU (ggml's tanh form) **(check)**;
+  3. GELU, the tanh form (ggml's `ggml_gelu`; `gelu_erf` is a separate op);
   4. a 4096→4096 linear.
 - **`img_in`** is a 64→4096 linear per latent pixel (patch size 1).
 - **Positions**, 3 axes, with head dimensions split 16/56/56, theta 10000:
@@ -81,7 +82,7 @@ There are no biases anywhere. The tensor names below are diffusers'
 **Timestep, once per step:**
 
 - Feed t = 1000·σ. Embed both t and 0 as 256 sinusoidal values (cos half,
-  then sin; period 10000) **(check)**.
+  then sin; period 10000, as ggml's `timestep_embedding`).
 - Then `linear_1` → SiLU → `linear_2`, then SiLU.
 - **`modulation.1`** (4096 → 4×4096) is shared by every block. Applied to
   [embed(t), embed(0)], it gives two rows per piece. Each of the four
@@ -102,6 +103,8 @@ attention (scale 1/√128):
 x = x + tanh(gate1[row]) * (attn · Wo)
 h = LayerNorm(x) * (1 + scale2[row])
 x = x + tanh(gate2[row]) * (W_out · (silu(h·W_gate) * (h·W_proj)))     (SwiGLU, 12288)
+    (the GGUF fuses them as gate_up: its first 12288 rows are W_gate, the
+    next W_proj; checked row by row against the diffusers checkpoint)
 ```
 
 **Output.** Keep the image tokens only. Then:
@@ -140,7 +143,8 @@ Turbo's 8 steps use a fixed sigma list, which sd.cpp names
 - **CFG is 1**, so there is one DiT pass per step and no negative prompt.
 - **Initial noise:** z ~ N(0, 1), shape 64 × H/16 × W/16.
 - **Update:** z ← z + (σ_{i+1} − σ_i) · v, a rectified-flow Euler step,
-  where v is the DiT output. This assumes v = noise − x₀ **(check)**.
+  where v is the DiT output and v = noise − x₀. sd.cpp's flow denoiser
+  takes x₀ = x − σ·v, and its Euler step is x += (σ' − σ)·(x − x₀)/σ.
 - **Before decoding**, denormalize per channel: z · std[c] + mean[c]. The
   64 means and 64 standard deviations are in the VAE config.
 - **Resolution:** sides must be multiples of 32. The model was trained up
@@ -173,10 +177,17 @@ RMS_norm: per pixel, x / rms over channels × gamma (eps 1e-12)
 - **Temporal upsampling** (first three stages) is skipped on frame 0: no
   `time_conv`.
 - **The shortcut's temporal factor 2 still changes how channels are
-  grouped** into the 2×2 spread. This is the subtlest part of the decoder;
-  verify it against dumped tensors **(check)**.
-- **sd.cpp's 1/128 conv scale** keeps FP16 in range. It is a numerical
-  device and does not apply at FP32 **(check)**.
+  grouped** into the 2×2 spread. From diffusers' `DupUp3D`
+  (repeat_interleave, a view as (out, ft, 2, 2), frame ft − 1 kept): output
+  channel c of pixel (Y, X) is input channel j / rep of pixel (Y/2, X/2),
+  with j = ((c·ft + ft − 1)·2 + Y%2)·2 + X%2 and rep = out·ft·4 / in.
+  It is not channel c in general; for example, 1152 → 576 takes channel
+  2c + 1.
+- **sd.cpp's 1/128 conv scale** keeps FP16 in range. diffusers has no such
+  scale, so at FP32 there is nothing to do.
+- **The weights confirm it is 2-D.** Every convolution's temporal kernel
+  size in the file is 1 (`[out, in, 1, 3, 3]`), and diffusers'
+  `QwenImage21CausalConv3d` is a `Conv2d`.
 - **Cost:** about 2.3 TFLOP per resolution level, about 12 TFLOP in all at
   1024², roughly a fifth of one DiT step. The largest activation is
   144 × 1024² floats, 600 MB in FP32.
