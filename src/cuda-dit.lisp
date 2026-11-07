@@ -221,9 +221,12 @@
                                                  (il::cuda-alloc dev (* 4 p wd) :zero nil)))))
                          (il::cuda-copy-dd (car pre) 0 kb 0 (* 4 p wd))
                          (il::cuda-copy-dd (cdr pre) 0 vb 0 (* 4 p wd)))))
-                (il::launch dev "x_attend" (list 32 (ceiling n 64)) 256
-                            (list q kb vb att 32 128 n n0 p l (coerce (/ (sqrt 128d0)) 'single-float))
-                            :shared (* 4 (+ (* 64 132) (* 32 132) (* 32 128) (* 32 68))))
+                (if (>= (il::cudev-arch dev) 80)
+                    (il::launch dev "x_attend_mma" (list 32 (ceiling n 128)) 256
+                                (list q kb vb att n n0 p l (coerce (/ (sqrt 128d0)) 'single-float)))
+                    (il::launch dev "x_attend" (list 32 (ceiling n 64)) 256
+                                (list q kb vb att 32 128 n n0 p l (coerce (/ (sqrt 128d0)) 'single-float))
+                                :shared (* 4 (+ (* 64 132) (* 32 132) (* 32 128) (* 32 68)))))
                 (mm d (blk "attn.to_out.0.weight") att hh n)
                 (elementwise d "x_gate_add" (* n wd) wd n0 p (* 4 wd) x hh (piece 1))
                 (il::launch dev "x_ln_mod" n 256 (list wd n n0 p (* 4 wd) x (piece 2) y))

@@ -197,3 +197,133 @@ extern "C" __global__ void x_silu(long long count, float* x) {
   const float v = x[i];
   x[i] = v / (1.f + expf(-v));
 }
+
+// x_attend's attention on the tensor cores (sm_80 and up): FlashAttention-2's
+// shape.  A block takes 128 queries of one head, its 8 warps 16 each; the
+// keys go 64 a step through shared memory as halves (K as rows, V
+// transposed), Q held in registers as m16n8k16 A fragments.  S = Q K^T and
+// O += P V are half products summed in floats; P is rounded to halves.
+// Lane l of a warp holds rows l/4 and l/4 + 8 of its 16, columns 2(l%4)
+// and the next of each 8-wide tile.  The mask is x_attend's.
+// grid (32 heads, ceil(n/128)), block 256.
+#define XM_Q 128
+#define XM_K 64
+#define XM_KS (128 + 8)                 // halves a K row in shared (+8: no bank conflicts)
+#define XM_VS (XM_K + 8)                // halves a row of V^T
+
+__device__ __forceinline__ unsigned xm_h2(float a, float b) { return (unsigned)f2h(a) | ((unsigned)f2h(b) << 16); }
+
+__device__ __forceinline__ void xm_mma(float* c, const unsigned* a, unsigned b0, unsigned b1) {
+#if __CUDA_ARCH__ >= 800
+  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+               : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+               : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#endif
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+x_attend_mma(const float* __restrict__ q, const float* __restrict__ kc, const float* __restrict__ vc,
+             float* __restrict__ out, int n, int q0, int p, int l, float scale) {
+  __shared__ __align__(16) u16 sk[XM_K * XM_KS];
+  __shared__ __align__(16) u16 sv[128 * XM_VS];
+  const int head = blockIdx.x, t0 = blockIdx.y * XM_Q;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, tg = lane & 3;
+  const int r0 = t0 + warp * 16 + g, r1 = r0 + 8;
+  unsigned qa[8][4];
+  {
+    const bool ok0 = r0 < n, ok1 = r1 < n;
+    const float* a = q + (long long)r0 * 4096 + head * 128;
+    const float* b = q + (long long)r1 * 4096 + head * 128;
+    const float2 z = make_float2(0.f, 0.f);
+#pragma unroll
+    for (int kk = 0; kk < 8; ++kk) {
+      const int c = kk * 16 + 2 * tg;
+      const float2 x0 = ok0 ? *(const float2*)(a + c) : z, x1 = ok1 ? *(const float2*)(b + c) : z;
+      const float2 x2 = ok0 ? *(const float2*)(a + c + 8) : z, x3 = ok1 ? *(const float2*)(b + c + 8) : z;
+      qa[kk][0] = xm_h2(x0.x * scale, x0.y * scale);
+      qa[kk][1] = xm_h2(x1.x * scale, x1.y * scale);
+      qa[kk][2] = xm_h2(x2.x * scale, x2.y * scale);
+      qa[kk][3] = xm_h2(x3.x * scale, x3.y * scale);
+    }
+  }
+  float o[16][4];
+#pragma unroll
+  for (int j = 0; j < 16; ++j) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.f;
+  float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;
+  const int lim0 = q0 + r0 < p ? q0 + r0 : l - 1, lim1 = q0 + r1 < p ? q0 + r1 : l - 1;
+  const int tmax = q0 + min(n, t0 + XM_Q) - 1;
+  const int last = tmax >= p ? l - 1 : tmax;
+  for (int k0 = 0; k0 <= last; k0 += XM_K) {
+    __syncthreads();
+    for (int e = tid; e < XM_K * 32; e += 256) {
+      const int key = e >> 5, c = (e & 31) * 4, kp = k0 + key;
+      const bool ok = kp <= last;
+      const long long off = (long long)kp * 4096 + head * 128 + c;
+      const float4 kv = ok ? __ldg((const float4*)(kc + off)) : make_float4(0.f, 0.f, 0.f, 0.f);
+      const float4 vv = ok ? __ldg((const float4*)(vc + off)) : make_float4(0.f, 0.f, 0.f, 0.f);
+      *(uint2*)(sk + key * XM_KS + c) = make_uint2(xm_h2(kv.x, kv.y), xm_h2(kv.z, kv.w));
+      sv[(c + 0) * XM_VS + key] = f2h(vv.x);
+      sv[(c + 1) * XM_VS + key] = f2h(vv.y);
+      sv[(c + 2) * XM_VS + key] = f2h(vv.z);
+      sv[(c + 3) * XM_VS + key] = f2h(vv.w);
+    }
+    __syncthreads();
+    float s[8][4];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      s[j][0] = s[j][1] = s[j][2] = s[j][3] = 0.f;
+#pragma unroll
+      for (int kk = 0; kk < 8; ++kk) {
+        const u16* kp = sk + (j * 8 + g) * XM_KS + kk * 16 + 2 * tg;
+        xm_mma(s[j], qa[kk], *(const unsigned*)kp, *(const unsigned*)(kp + 8));
+      }
+    }
+    float mx0 = m0, mx1 = m1;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const int a = k0 + j * 8 + 2 * tg;
+      if (a > lim0) s[j][0] = -INFINITY;
+      if (a + 1 > lim0) s[j][1] = -INFINITY;
+      if (a > lim1) s[j][2] = -INFINITY;
+      if (a + 1 > lim1) s[j][3] = -INFINITY;
+      mx0 = fmaxf(mx0, fmaxf(s[j][0], s[j][1]));
+      mx1 = fmaxf(mx1, fmaxf(s[j][2], s[j][3]));
+    }
+    mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, 1)); mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, 2));
+    mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, 1)); mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, 2));
+    const float f0 = mx0 == -INFINITY ? 1.f : expf(m0 - mx0), f1 = mx1 == -INFINITY ? 1.f : expf(m1 - mx1);
+    float ls0 = 0.f, ls1 = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      s[j][0] = mx0 == -INFINITY ? 0.f : expf(s[j][0] - mx0);
+      s[j][1] = mx0 == -INFINITY ? 0.f : expf(s[j][1] - mx0);
+      s[j][2] = mx1 == -INFINITY ? 0.f : expf(s[j][2] - mx1);
+      s[j][3] = mx1 == -INFINITY ? 0.f : expf(s[j][3] - mx1);
+      ls0 += s[j][0] + s[j][1];
+      ls1 += s[j][2] + s[j][3];
+    }
+    ls0 += __shfl_xor_sync(0xffffffff, ls0, 1); ls0 += __shfl_xor_sync(0xffffffff, ls0, 2);
+    ls1 += __shfl_xor_sync(0xffffffff, ls1, 1); ls1 += __shfl_xor_sync(0xffffffff, ls1, 2);
+    l0 = l0 * f0 + ls0; l1 = l1 * f1 + ls1;
+    m0 = mx0; m1 = mx1;
+#pragma unroll
+    for (int j = 0; j < 16; ++j) { o[j][0] *= f0; o[j][1] *= f0; o[j][2] *= f1; o[j][3] *= f1; }
+#pragma unroll
+    for (int kk = 0; kk < 4; ++kk) {
+      const unsigned pa[4] = {xm_h2(s[2 * kk][0], s[2 * kk][1]), xm_h2(s[2 * kk][2], s[2 * kk][3]),
+                              xm_h2(s[2 * kk + 1][0], s[2 * kk + 1][1]), xm_h2(s[2 * kk + 1][2], s[2 * kk + 1][3])};
+#pragma unroll
+      for (int j = 0; j < 16; ++j) {
+        const u16* vp = sv + (j * 8 + g) * XM_VS + kk * 16 + 2 * tg;
+        xm_mma(o[j], pa, *(const unsigned*)vp, *(const unsigned*)(vp + 8));
+      }
+    }
+  }
+  const float i0 = 1.f / l0, i1 = 1.f / l1;
+#pragma unroll
+  for (int j = 0; j < 16; ++j) {
+    const int c = head * 128 + j * 8 + 2 * tg;
+    if (r0 < n) *(float2*)(out + (long long)r0 * 4096 + c) = make_float2(o[j][0] * i0, o[j][1] * i0);
+    if (r1 < n) *(float2*)(out + (long long)r1 * 4096 + c) = make_float2(o[j][2] * i1, o[j][3] * i1);
+  }
+}
