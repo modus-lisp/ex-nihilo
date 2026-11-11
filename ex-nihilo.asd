@@ -24,4 +24,6 @@
 (defsystem "ex-nihilo/server"
   :description "OpenAI's image API: POST /v1/images/generations, and a page to try it."
   :depends-on ("ex-nihilo" "illatio/server")
-  :components ((:module "src" :components ((:file "server")))))
+  :components ((:module "src" :serial t
+                :components ((:file "server")
+                             (:file "tenant" :if-feature (:and :sbcl :linux))))))   ; in illatio's server, sharing its GPUs

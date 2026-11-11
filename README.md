@@ -17,7 +17,7 @@ illatio already provides and the milestones.
 
 `bin/ex-nihilo` serves OpenAI's image API on loopback (no authentication):
 
-    bin/ex-nihilo [--port 9940] [--weights /dev/shm/exn] [--device 0] [--encoder-device 1|cpu]
+    bin/ex-nihilo [--port 9940] [--weights /mnt/ollama/exn] [--encoder FILE] [--device 0] [--encoder-device 1|cpu]
 
     curl -s localhost:9940/v1/images/generations \
       -d '{"prompt": "a lighthouse at dusk, oil painting", "size": "1536x1024", "seed": 7}'
@@ -28,3 +28,14 @@ of 16 from 256 to 2048, at most 1536x1024's pixels), `n` (1-4),
 (`transparent` for RGBA) and `seed`; it answers `{"created", "data": [{"b64_json",
 "seed"}]}`. `GET /` is a page to try it from a browser; `GET /v1/models` and
 `GET /health` as illatio's. Requests take turns on the GPU.
+
+In illatio's server instead, beside a chat model on the same GPUs:
+`bin/illatio-server -m CHAT-MODEL --gpu --images /mnt/ollama/exn` (illatio
+loads this system for the flag; `src/tenant.lisp`).  The two take turns: these
+models wait in pinned host memory and come back for a picture, the chat
+model moved out meanwhile.
+
+`--encoder` loads another Qwen3-VL-8B GGUF in place of the weights directory's
+`te-q8_0.gguf`, for example AtomicChat's abliterated encoder
+(`Qwen-Image-2.1-Turbo-Uncensored-Q8_0.gguf`), which is the same architecture
+with its refusal direction projected out.

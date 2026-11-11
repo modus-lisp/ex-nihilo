@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # bin/ex-nihilo — serve OpenAI's image API (src/server.lisp).
-#   bin/ex-nihilo [--host H] [--port 9940] [--weights /dev/shm/exn] [--device 0] [--encoder-device 1|cpu]
+#   bin/ex-nihilo [--host H] [--port 9940] [--weights /mnt/ollama/exn] [--encoder FILE] [--device 0] [--encoder-device 1|cpu]
 set -euo pipefail
 ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd -P)"
 exec "${EXN_SBCL:-sbcl}" --dynamic-space-size "${EXN_HEAP_MB:-16384}" --noinform --non-interactive \

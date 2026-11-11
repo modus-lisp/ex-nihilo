@@ -102,8 +102,8 @@
 
 ;;; --- all three ------------------------------------------------------------------
 
-(defun check-weights (&key (dit "/dev/shm/exn/dit-q8_0.gguf") (vae "/dev/shm/exn/vae.safetensors")
-                           (encoder "/dev/shm/exn/te-q8_0.gguf"))
+(defun check-weights (&key (dit "/mnt/ollama/exn/dit-q8_0.gguf") (vae "/mnt/ollama/exn/vae.safetensors")
+                           (encoder "/mnt/ollama/exn/te-q8_0.gguf"))
   "Open each file and report what it holds."
   (let ((g (open-dit dit)))
     (format t "DiT: ~D tensors as expected, ~,2F GB (~{~A~^, ~})~%"

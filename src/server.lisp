@@ -23,6 +23,10 @@
 (defvar *engine* nil)
 (defvar *gpu-lock* (sb-thread:make-mutex :name "ex-nihilo engine"))
 
+(defvar *on-gpu* (lambda (fn) (sb-thread:with-mutex (*gpu-lock*) (funcall fn)))
+  "How a request's pictures get the GPU: a function called with a thunk.
+   Alone, a lock; in illatio's server, its devices lent (tenant.lisp).")
+
 ;;; --- base64 -----------------------------------------------------------------
 
 (defparameter +base64+ "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
@@ -79,17 +83,24 @@
 
 (defun images-object (req)
   (multiple-value-bind (prompt w h n seed format alpha) (image-request req)
-    (let ((data (loop for k below n
-                      collect (let ((png (sb-thread:with-mutex (*gpu-lock*)
-                                           (multiple-value-bind (px pw ph)
-                                               (generate *engine* prompt :width w :height h :seed (+ seed k))
-                                             (png-pure:encode-png (rgba-octets px :alpha alpha) pw ph
-                                                                  :channels (if alpha 4 3))))))
-                                (if (equal format "url")
+    (let* ((pngs (let ((made '()))      ; the n pictures in one turn on the GPU
+                   (funcall *on-gpu*
+                            (lambda ()
+                              (dotimes (k n)
+                                (multiple-value-bind (px pw ph)
+                                    (generate *engine* prompt :width w :height h :seed (+ seed k))
+                                  (push (list px pw ph) made)))))
+                   (mapcar (lambda (m)
+                             (destructuring-bind (px pw ph) m
+                               (png-pure:encode-png (rgba-octets px :alpha alpha) pw ph :channels (if alpha 4 3))))
+                           (nreverse made))))
+           (data (loop for k below n
+                      for png in pngs
+                      collect (if (equal format "url")
                                     (il::hobj "url" (concatenate 'string "data:image/png;base64," (base64-encode png))
                                               "revised_prompt" prompt "seed" (+ seed k))
                                     (il::hobj "b64_json" (base64-encode png) "revised_prompt" prompt
-                                              "seed" (+ seed k)))))))
+                                              "seed" (+ seed k))))))
       (il::hobj "created" (- (get-universal-time) #.(encode-universal-time 0 0 0 1 1 1970 0))
                 "data" (coerce data 'vector)
                 "size" (format nil "~Dx~D" w h) "output_format" "png"))))
@@ -138,6 +149,16 @@ $('go').onclick=go; $('p').onkeydown=e=>{if(e.key==='Enter'&&(e.metaKey||e.ctrlK
 
 ;;; --- the listener -----------------------------------------------------------------
 
+(defparameter +images-paths+ '("/v1/images/generations" "/images/generations"))
+
+(defun handle-images (s body)
+  "POST /v1/images/generations: BODY answered on S."
+  (let ((req (ignore-errors (json-simple:parse body))))
+    (if (hash-table-p req)
+        (handler-case (il::respond s "200 OK" (images-object req))
+          (bad-request (e) (il::respond s "400 Bad Request" (il::error-object (princ-to-string e)))))
+        (il::respond s "400 Bad Request" (il::error-object "the body is not a JSON object")))))
+
 (defun handle-connection (s)
   (handler-case
       (multiple-value-bind (method path headers body) (il::read-request s)
@@ -153,13 +174,8 @@ $('go').onclick=go; $('p').onkeydown=e=>{if(e.key==='Enter'&&(e.metaKey||e.ctrlK
                                                                         "owned_by" "ex-nihilo")))))
             ((and (string= method "GET") (string= path "/"))
              (il::respond s "200 OK" +page+ :type "text/html; charset=utf-8"))
-            ((and (string= method "POST") (member path '("/v1/images/generations" "/images/generations")
-                                                  :test #'string=))
-             (let ((req (ignore-errors (json-simple:parse body))))
-               (if (hash-table-p req)
-                   (handler-case (il::respond s "200 OK" (images-object req))
-                     (bad-request (e) (il::respond s "400 Bad Request" (il::error-object (princ-to-string e)))))
-                   (il::respond s "400 Bad Request" (il::error-object "the body is not a JSON object")))))
+            ((and (string= method "POST") (member path +images-paths+ :test #'string=))
+             (handle-images s body))
             (t (il::respond s "404 Not Found"
                             (il::error-object (format nil "no route for ~A ~A" method path) "not_found"))))))
     (stream-error () nil)               ; the client went away
@@ -176,8 +192,9 @@ $('go').onclick=go; $('p').onkeydown=e=>{if(e.key==='Enter'&&(e.metaKey||e.ctrlK
                        :backend :tcp :host host :port port))
 
 (defun main (args)
-  "bin/ex-nihilo: [--host H] [--port P] [--weights DIR] [--device N] [--encoder-device N|cpu]"
-  (let ((host "127.0.0.1") (port 9940) (dir "/dev/shm/exn/") (device 0) (encoder-device 1))
+  "bin/ex-nihilo: [--host H] [--port P] [--weights DIR] [--encoder FILE] [--device N] [--encoder-device N|cpu]
+   --encoder replaces DIR's te-q8_0.gguf with another Qwen3-VL-8B GGUF, e.g. a fine-tune."
+  (let ((host "127.0.0.1") (port 9940) (dir "/mnt/ollama/exn/") (encoder nil) (device 0) (encoder-device 1))
     (handler-case
      (loop while args
           do (let ((flag (pop args)) (v (pop args)))
@@ -185,16 +202,19 @@ $('go').onclick=go; $('p').onkeydown=e=>{if(e.key==='Enter'&&(e.metaKey||e.ctrlK
                (cond ((string= flag "--host") (setf host v))
                      ((string= flag "--port") (setf port (parse-integer v)))
                      ((string= flag "--weights") (setf dir (uiop:ensure-directory-pathname v)))
+                     ((string= flag "--encoder")
+                      (unless (probe-file v) (error "--encoder ~A: no such file" v))
+                      (setf encoder v))
                      ((string= flag "--device") (setf device (parse-integer v)))
                      ((string= flag "--encoder-device")
                       (setf encoder-device (if (string-equal v "cpu") nil (parse-integer v))))
                      (t (error "unknown flag ~A" flag)))))
       (error (e)
-        (format *error-output* "ex-nihilo: ~A~%usage: bin/ex-nihilo [--host H] [--port 9940] [--weights DIR] [--device N] [--encoder-device N|cpu]~%" e)
+        (format *error-output* "ex-nihilo: ~A~%usage: bin/ex-nihilo [--host H] [--port 9940] [--weights DIR] [--encoder FILE] [--device N] [--encoder-device N|cpu]~%" e)
         (uiop:quit 2)))
     (let ((e (load-engine :dit (namestring (merge-pathnames "dit-q8_0.gguf" dir))
                           :vae (namestring (merge-pathnames "vae.safetensors" dir))
-                          :encoder (namestring (merge-pathnames "te-q8_0.gguf" dir))
+                          :encoder (or encoder (namestring (merge-pathnames "te-q8_0.gguf" dir)))
                           :device device :encoder-device encoder-device)))
       (serve e :host host :port port)
       (format *error-output* "ex-nihilo: listening on http://~A:~D/~%" host port)
