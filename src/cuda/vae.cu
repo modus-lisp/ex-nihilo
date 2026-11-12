@@ -12,7 +12,8 @@
 //   x_avgdown_add(cin, cout, ft, h, w, x, y)   Y (H/2 x W/2 x COUT) += AvgDown3D(X) (H x W x CIN), one frame
 //   x_split3(n, c, qkv, q, k, v)               QKV's rows (3C) apart into three N x C
 //   x_transpose(rows, cols, x, y)              Y (COLS x ROWS) = X^T
-//   x_softmax_rows(n, cols, scale, s)          each row of S: softmax(S * SCALE)
+//   x_softmax_rows(n, cols, stride, scale, s)  each row of S (STRIDE apart): softmax of its first
+//                                              COLS * SCALE, the rest of the row zeroed
 //   x_clamp1(count, x)                         X into -1 .. 1
 
 // The product's tiles (illatio's d41_mm_f32): a block 64 pixels x 64
@@ -190,9 +191,10 @@ extern "C" __global__ void x_transpose(int rows, int cols, const float* __restri
 }
 
 // grid n rows, block 256
-extern "C" __global__ void x_softmax_rows(int n, int cols, float scale, float* s) {
+extern "C" __global__ void x_softmax_rows(int n, int cols, int stride, float scale, float* s) {
   __shared__ float red[32];
-  float* r = s + (long long)blockIdx.x * cols;
+  float* r = s + (long long)blockIdx.x * stride;
+  for (int i = cols + threadIdx.x; i < stride; i += blockDim.x) r[i] = 0.f;
   float mx = -INFINITY;
   for (int i = threadIdx.x; i < cols; i += blockDim.x) mx = fmaxf(mx, r[i]);
   // a block's maximum: d4_block_sum's shape, with fmaxf

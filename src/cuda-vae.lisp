@@ -85,16 +85,20 @@
                             (conv3 (format nil "~A.residual.6" p) t1 t2 o o hh ww)
                             (conv1 (format nil "~A.shortcut" p) x out i o n t2)))))
                  (attention (prefix x out c n)
-                   ;; one head over the N pixels: S[t][r] = K[r].Q[t], softmax, A[t] = V^T . P[t]
-                   (let ((t1 (b :at (* n c))) (qkv (b :qkv (* n 3 c))) (q (b :q (* n c))) (k (b :k (* n c)))
-                         (vv (b :vv (* n c))) (vt (b :vt (* n c))) (s (b :s (* n n))))
+                   ;; one head over the N pixels: S[t][r] = K[r].Q[t], softmax, A[t] = V^T . P[t].  The
+                   ;; second product sums over the pixels, and d41_mm_f32 takes its sums 16 at a time: S's
+                   ;; rows and V^T's are NP long, N padded to a multiple of 16 with zeros
+                   (let* ((np (* 16 (ceiling n 16)))
+                          (t1 (b :at (* n c))) (qkv (b :qkv (* n 3 c))) (q (b :q (* n c))) (k (b :k (* n c)))
+                          (vv (b :vv (* np c))) (vt (b :vt (* np c))) (s (b :s (* n np))))
                      (il::launch dev "v_rms" n 256 (list c 1f-12 x (wt (format nil "~A.norm.gamma" prefix)) t1))
                      (conv1 (format nil "~A.to_qkv" prefix) t1 qkv c (* 3 c) n)
+                     (when (/= np n) (il::cuda-zero vv))   ; V's padding rows: zero
                      (ew "x_split3" (* n c) c qkv q k vv)
-                     (il::launch dev "d41_mm_f32" (list (ceiling n 64) (ceiling n 64)) 256 (list c n n c n k q s))
-                     (il::launch dev "x_softmax_rows" n 256 (list n n (coerce (/ (sqrt (float c 1d0))) 'single-float) s))
-                     (il::launch dev "x_transpose" (list (ceiling c 32) (ceiling n 32)) '(32 8) (list n c vv vt))
-                     (il::launch dev "d41_mm_f32" (list (ceiling n 64) (ceiling c 64)) 256 (list n c n n c vt s t1))
+                     (il::launch dev "d41_mm_f32" (list (ceiling n 64) (ceiling n 64)) 256 (list c n n c np k q s))
+                     (il::launch dev "x_softmax_rows" n 256 (list n n np (coerce (/ (sqrt (float c 1d0))) 'single-float) s))
+                     (il::launch dev "x_transpose" (list (ceiling c 32) (ceiling np 32)) '(32 8) (list np c vv vt))
+                     (il::launch dev "d41_mm_f32" (list (ceiling n 64) (ceiling c 64)) 256 (list np c n np c vt s t1))
                      (conv1 (format nil "~A.proj" prefix) t1 out c c n x)))
                  (conv3s2 (name x y cin cout hh ww)
                    (il::launch dev "x_conv3s2" (list (ceiling (* (floor hh 2) (floor ww 2)) 64) (ceiling cout 64)) 256

@@ -1,49 +1,142 @@
 # ex-nihilo
 
-Image generation in **pure Common Lisp**: a diffusion engine, a sibling of
-[illatio](https://github.com/modus-lisp/illatio), sized for the same two
-machines (a 48 GB MacBook Pro, a single 24 GB NVIDIA card).
+Pictures **out of nothing**, in Common Lisp: Qwen-Image-2.1-Turbo's prompt
+encoder, diffusion transformer and decoder, run by SBCL and a few CUDA
+kernels -- no Python, no PyTorch. A sibling of
+[illatio](https://github.com/modus-lisp/illatio), on its GGUF reader, its
+CUDA layer and its devices.
 
 *Ex nihilo*, Latin: "out of nothing" -- a picture from pure noise.
 
-Nothing runs yet.  [docs/research.md](docs/research.md) chooses the model
-(Qwen-Image-2.1-Turbo, with Z-Image-Turbo as the fallback) and the
-reference implementation (stable-diffusion.cpp).
-[docs/design.md](docs/design.md) is the model read closely -- the prompt
-encoder, the DiT and its prefix cache, the schedule, the decoder -- with what
-illatio already provides and the milestones.
+![A lighthouse at dusk, oil painting](docs/pictures/lighthouse.jpg)
 
-## Serving
+<sub>This one, exactly (same prompt, same seed, same picture):</sub>
+
+    curl -s localhost:9940/v1/images/generations \
+      -d '{"prompt": "a lighthouse at dusk, oil painting", "size": "1536x1024", "seed": 7}'
+
+## A few more
+
+Each 1024x1024, eight steps, about 11 seconds on an RTX 3090; the prompt
+under each is all it was given.
+
+| | | |
+|:---:|:---:|:---:|
+| ![](docs/pictures/fox.jpg) | ![](docs/pictures/bakery.jpg) | ![](docs/pictures/venice.jpg) |
+| <sub>*a red fox curled up asleep in fresh snow, early morning light, telephoto wildlife photograph, shallow depth of field*</sub> | <sub>*a hand-painted wooden sign outside a little bakery reading 'FRESH BREAD' above 'OPEN DAILY', warm morning sunlight, photograph*</sub> | <sub>*a watercolor painting of a quiet Venice canal with gondolas, loose wet washes, white paper showing through*</sub> |
+| ![](docs/pictures/moon.jpg) | ![](docs/pictures/cabin.jpg) | ![](docs/pictures/coffee.jpg) |
+| <sub>*flat vector illustration of an astronaut tending a vegetable garden on the moon, the Earth rising in the black sky, limited pastel palette*</sub> | <sub>*isometric pixel art of a tiny cozy log cabin in a snowy pine forest at night, warm glowing windows, smoke from the chimney*</sub> | <sub>*a steaming cup of coffee beside an open notebook and a fountain pen on a wooden cafe table, rainy window behind, 35mm film photograph*</sub> |
+
+**Words come out spelled right.** Quote the text the picture must hold, as
+the bakery's prompt does.
+
+<img src="docs/pictures/robot.png" width="256" align="right" alt="a cartoon robot sticker on a transparent background">
+
+**Cut-outs, too.** The decoder makes RGBA: ask for `"background":
+"transparent"` and say so in the prompt (*a cheerful little cartoon robot
+waving, sticker style with a thick white outline, isolated on a transparent
+background*), and the picture comes with its alpha -- this robot has no
+background at all.
+
+<br clear="right">
+
+## From a picture
+
+Give it a picture as well as a prompt and it starts from that picture instead
+of from noise: the picture is encoded, noised part of the way, and the steps
+run from there. `strength` says how far it may go.
+
+| source | 0.6 | 0.8 | 0.9 |
+|:---:|:---:|:---:|:---:|
+| ![](docs/pictures/storm-0.jpg) | ![](docs/pictures/storm-0.6.jpg) | ![](docs/pictures/storm-0.8.jpg) | ![](docs/pictures/storm-0.9.jpg) |
+
+<sub>The lighthouse above, with *a lighthouse at night in a snowstorm, its beam
+cutting through the falling snow, oil painting*: at 0.6 the lamp is lit, at
+0.8 the snow comes, at 0.9 it is night and the tower redrawn.</sub>
+
+It is best at light, weather, season and mood, with the composition kept; a
+photograph turned into another medium wants a high strength (0.9 and up).
+Precise edits ("remove the car") are an editing model's job, not this one's.
+
+## How it works
+
+    prompt ──► Qwen3-VL-8B's text model (Q8_0) ──► its last states, kept per prompt
+                                                        │
+    noise (or a picture, encoded and noised) ──► DiT: 7B, 32 blocks, 8 Euler steps
+                                                        │
+                                              VAE decoder (Wan 2.2's) ──► RGBA PNG
+
+Qwen-Image-2.1-Turbo is a flow-matching model distilled to eight steps with
+no classifier-free guidance, so a picture is eight passes of the DiT and one
+of the decoder. The encoder's states for a prompt are computed once and kept;
+the DiT's products and attention run on the tensor cores; the VAE's decoder
+and encoder share their building blocks. [docs/design.md](docs/design.md) is
+the model read closely, [docs/research.md](docs/research.md) why this model,
+and `inspect/` holds the numpy references the kernels were checked against.
+
+On an RTX 3090, the encoder on a second card: 1024x1024 in about 11 s (9.5 s
+of steps, 1.5 s of decoding), 1536x1024 in about 22 s. A picture from a
+picture takes half a second more to encode, and fewer steps.
+
+## Running it
+
+SBCL on Linux and an NVIDIA GPU: the DiT and decoder on a 24 GB card, the
+prompt encoder on a second (or on the CPU, slower), illatio checked out
+beside this directory. The weights, about 17 GB:
+
+    mkdir -p /mnt/ollama/exn && cd /mnt/ollama/exn
+    curl -L -o vae.safetensors https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/vae/qwen_image_2.1_vae_bf16.safetensors
+    curl -L -o dit-q8_0.gguf   https://huggingface.co/unsloth/Qwen-Image-2.1-Turbo-GGUF/resolve/main/qwen-image-2.1-turbo-Q8_0.gguf
+    curl -L -o te-q8_0.gguf    https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF/resolve/main/Qwen3VL-8B-Instruct-Q8_0.gguf
 
 `bin/ex-nihilo` serves OpenAI's image API on loopback (no authentication):
 
     bin/ex-nihilo [--port 9940] [--weights /mnt/ollama/exn] [--encoder FILE] [--device 0] [--encoder-device 1|cpu]
 
-    curl -s localhost:9940/v1/images/generations \
-      -d '{"prompt": "a lighthouse at dusk, oil painting", "size": "1536x1024", "seed": 7}'
+`GET /` is a page to try it from a browser.
 
-`POST /v1/images/generations` takes `prompt`, `size` (`WxH`, sides multiples
-of 16 from 256 to 2048, at most 1536x1024's pixels), `n` (1-4),
-`response_format` (`b64_json`, or `url` for a `data:` URL), `background`
-(`transparent` for RGBA) and `seed`; it answers `{"created", "data": [{"b64_json",
-"seed"}]}`. `GET /` is a page to try it from a browser; `GET /v1/models` and
-`GET /health` as illatio's. Requests take turns on the GPU.
+### The API
 
-A picture can be made from another: `image` (a `data:` URL or bare base64 of
-a PNG, JPEG or WebP) is encoded by the VAE's encoder, noised, and the steps run
-from there, the prompt describing the whole result. `strength` (0-1, default
-0.8) is the share of Turbo's eight steps that run: about 0.5 keeps the picture
-close, 0.8 restyles and relights it with its composition kept, 0.9 keeps only
-its layout, 1 ignores it. Without `size` the result takes the source's shape
-(up to a megapixel).
+`POST /v1/images/generations` takes:
 
-In illatio's server instead, beside a chat model on the same GPUs:
-`bin/illatio-server -m CHAT-MODEL --gpu --images /mnt/ollama/exn` (illatio
-loads this system for the flag; `src/tenant.lisp`).  The two take turns: these
-models wait in pinned host memory and come back for a picture, the chat
-model moved out meanwhile.
+- `prompt`
+- `size`: `WxH`, sides multiples of 16 from 256 to 2048, at most 1536x1024's
+  pixels (default 1024x1024)
+- `n`: 1-4
+- `seed`: the same prompt and seed give the same picture
+- `background`: `transparent` for RGBA
+- `response_format`: `b64_json`, or `url` for a `data:` URL
+- `image`: a picture to start from, a `data:` URL or bare base64 of a PNG,
+  JPEG or WebP; without `size` the result takes its shape (up to a megapixel)
+- `strength`: with `image`, 0-1 (default 0.8), the share of the eight steps
+  that run -- about 0.5 keeps it close, 0.8 relights and restyles it with its
+  composition kept, 0.9 keeps only its layout, 1 ignores it
 
-`--encoder` loads another Qwen3-VL-8B GGUF in place of the weights directory's
-`te-q8_0.gguf`, for example AtomicChat's abliterated encoder
-(`Qwen-Image-2.1-Turbo-Uncensored-Q8_0.gguf`), which is the same architecture
-with its refusal direction projected out.
+It answers `{"created", "data": [{"b64_json", "seed"}]}`. `GET /v1/models`
+and `GET /health` are as illatio's. Requests take turns on the GPU.
+
+### Beside a chat model
+
+In illatio's server instead, sharing the GPUs with a chat model:
+
+    bin/illatio-server -m CHAT-MODEL --gpu --images /mnt/ollama/exn
+
+illatio loads this system for the flag (`src/tenant.lisp`). The two take
+turns: these models wait in pinned host memory and come back for a picture,
+the chat model moved out meanwhile -- a few seconds each way. That is how
+[operandi](https://github.com/modus-lisp/operandi) runs a local chat model
+and draws its pictures from one server.
+
+### Another encoder
+
+`--encoder FILE` (illatio's `--image-encoder`) loads another Qwen3-VL-8B GGUF
+in place of `te-q8_0.gguf` -- for example AtomicChat's abliterated encoder,
+[`Qwen-Image-2.1-Turbo-Uncensored-Q8_0.gguf`](https://huggingface.co/AtomicChat/Qwen-Image-2.1-Turbo-Uncensored-GGUF),
+the same architecture with its refusal direction projected out.
+
+## Not yet
+
+Apple Silicon (the design is sized for a 48 GB MacBook Pro; the kernels are
+CUDA so far), editing models, LoRAs.
+
+MIT licensed.
