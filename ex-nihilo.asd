@@ -23,6 +23,7 @@
      (:file "cuda-vision" :if-feature (:and :sbcl :linux)) ; Qwen3-VL's vision tower, for editing
      (:file "metal-dit" :if-feature (:and :sbcl :darwin))  ; the DiT on Apple silicon (kernels: src/metal/)
      (:file "metal-vae" :if-feature (:and :sbcl :darwin))  ; the decoder there
+     (:file "metal-vision" :if-feature (:and :sbcl :darwin)) ; Qwen3-VL's vision tower there, for editing
      (:file "generate")))))  ; noise, eight steps, the decoder: a PNG
 
 (defsystem "ex-nihilo/server"

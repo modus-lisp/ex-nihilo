@@ -40,9 +40,17 @@
 
 (defun load-encoder (path &key device (threads (il::default-thread-count)))
   "The prompt encoder: the qwen3vl GGUF at PATH, its text model -- on CUDA
-   device DEVICE (illatio's dense path), or on the CPU when DEVICE is NIL."
+   device DEVICE (illatio's dense path), on a Mac its GPU when DEVICE is
+   true (illatio's Metal dense path, in ex-nihilo's library), or on the CPU
+   when DEVICE is NIL."
   #+(and sbcl linux) (when device (return-from load-encoder (il::load-model-cuda path :device device)))
+  #+(and sbcl darwin) (when device (return-from load-encoder (il::load-model-gpu path :gpu (exn-gpu))))
   (il::load-model path :threads threads))
+
+(defun encoder-gpu-p (model)
+  "Whether MODEL, the prompt encoder, runs on a GPU."
+  (or #+(and sbcl linux) (il::model-cuda model)
+      #+(and sbcl darwin) (il::model-gpu model)))
 
 (defun encode-prompt (model prompt &key vision picture)
   "(values states p a): the P x 4096 floats the DiT reads for PROMPT.  With
@@ -58,12 +66,52 @@
     (multiple-value-bind (all) (encoder-states model ids)
       (values (subseq all (* skip (il::model-d model))) (- n skip) 0))))
 
-(defun encode-edit-prompt (model prompt vision picture)
-  #-(and sbcl linux) (declare (ignore model prompt vision picture))
-  #-(and sbcl linux) (error "editing a picture wants the encoder on a GPU")
+(defun call-with-picture-rows (model merged deep d rows-in fn)
+  "FN called with the encoder's passes taking a picture's rows: MERGED's (the
+   vision tower's, D wide) in place of the image pads after the embedding,
+   DEEP's (a list) added after the first layers.  ROWS-IN: of a pass's first
+   position and count, (values its first picture row, the picture's row
+   there, how many), or NIL."
   #+(and sbcl linux)
+  (let* ((dev (il::cmodel-dev (il::model-cuda model)))
+         (il::*after-embed*
+           (lambda (x pos0 k)
+             (multiple-value-bind (at from count) (funcall rows-in pos0 k)
+               (when at
+                 (il::cuda-copy-dd x (* 4 at d) merged (* 4 from d) (* 4 count d))))))
+         (il::*after-layer*
+           (lambda (li x pos0 k)
+             (when (< li (length deep))
+               (multiple-value-bind (at from count) (funcall rows-in pos0 k)
+                 (when at
+                   (il::launch dev "v_add" (ceiling (* count d) 256) 256
+                               (list (list :i64 (* count d)) (cons x (* 4 at d))
+                                     (cons (nth li deep) (* 4 from d))))))))))
+    (declare (ignorable model))
+    (funcall fn))
+  #+(and sbcl darwin)
+  (let* ((gpu (exn-gpu))
+         (il::*gpu-after-embed*
+           (lambda (e x pos0 k)
+             (multiple-value-bind (at from count) (funcall rows-in pos0 k)
+               (when at
+                 (il::dispatch gpu e "x_copy" (list (* count d))
+                               (list (cons merged (* 4 from d)) (cons x (* 4 at d)))
+                               (ceiling (* count d) 256) 256)))))
+         (il::*gpu-after-layer*
+           (lambda (e li x pos0 k)
+             (when (< li (length deep))
+               (multiple-value-bind (at from count) (funcall rows-in pos0 k)
+                 (when at
+                   (il::dispatch gpu e "x_add" (list (* count d))
+                                 (list (cons x (* 4 at d)) (cons (nth li deep) (* 4 from d)))
+                                 (ceiling (* count d) 256) 256)))))))
+    (declare (ignorable model))
+    (funcall fn)))
+
+(defun encode-edit-prompt (model prompt vision picture)
   (destructuring-bind (px h w) picture
-    (unless (il::model-cuda model) (error "editing a picture wants the encoder on a GPU"))
+    (unless (encoder-gpu-p model) (error "editing a picture wants the encoder on a GPU"))
     (multiple-value-bind (before after) (edit-prompt-pieces prompt)
       (let* ((b (il::tokenize model before :add-bos nil)) (e (il::tokenize model after :add-bos nil))
              (skip (length (il::tokenize model +system-turn+ :add-bos nil)))
@@ -79,29 +127,18 @@
           (flet ((rows-in (pos0 k)        ; the picture's rows among this pass's: (row0 . start), count
                    (let ((lo (max pos0 a0)) (hi (min (+ pos0 k) (+ a0 m))))
                      (when (< lo hi) (values (- lo pos0) (- lo a0) (- hi lo))))))
-            (let* ((dev (il::cmodel-dev (il::model-cuda model)))
-                   (il::*after-embed*
-                     (lambda (x pos0 k)
-                       (multiple-value-bind (at from count) (rows-in pos0 k)
-                         (when at
-                           (il::cuda-copy-dd x (* 4 at d) merged (* 4 from d) (* 4 count d))))))
-                   (il::*after-layer*
-                     (lambda (li x pos0 k)
-                       (when (< li (length deep))
-                         (multiple-value-bind (at from count) (rows-in pos0 k)
-                           (when at
-                             (il::launch dev "v_add" (ceiling (* count d) 256) 256
-                                         (list (list :i64 (* count d)) (cons x (* 4 at d))
-                                               (cons (nth li deep) (* 4 from d))))))))))
-              (let ((all (encoder-states model ids
-                                         :rope (mrope-table positions (il::model-rope-dims model)
-                                                            (il::model-rope-base model)))))
-                ;; the text's states, the system turn and the picture's rows left out
-                (let ((out (f32vec (* (- n skip m) d))))
-                  (replace out all :start2 (* skip d) :end2 (* a0 d))
-                  (replace out all :start1 (* (- a0 skip) d) :start2 (* (+ a0 m) d))
-                  (vision-release vision)
-                  (values out (- n skip m) (- a0 skip)))))))))))
+            (let ((all (call-with-picture-rows
+                        model merged deep d #'rows-in
+                        (lambda ()
+                          (encoder-states model ids
+                                          :rope (mrope-table positions (il::model-rope-dims model)
+                                                             (il::model-rope-base model)))))))
+              ;; the text's states, the system turn and the picture's rows left out
+              (let ((out (f32vec (* (- n skip m) d))))
+                (replace out all :start2 (* skip d) :end2 (* a0 d))
+                (replace out all :start1 (* (- a0 skip) d) :start2 (* (+ a0 m) d))
+                (vision-release vision)
+                (values out (- n skip m) (- a0 skip))))))))))
 
 (defun encoder-states (model ids &key rope)
   "Every token's state after the text model's last block, before its final
@@ -115,9 +152,12 @@
       (il::with-cuda
         (il::cuda-current (il::cmodel-dev (il::model-cuda model)))
         (il::cuda-upload-vector (il::cctx-rope (il::cuda-state ctx)) rope)))
+    #+(and sbcl darwin)
+    (when (and rope (il::model-gpu model)) (il::gpu-set-rope ctx rope))
     (unwind-protect
-         (loop with gpu = #+(and sbcl linux) (il::model-cuda model) #-(and sbcl linux) nil
-               with step = (if gpu il::*cuda-chunk* il::*prefill-chunk*)
+         (loop with gpu = (encoder-gpu-p model)
+               with step = (if gpu #+(and sbcl linux) il::*cuda-chunk* #-(and sbcl linux) il::*gpu-chunk*
+                               il::*prefill-chunk*)
                with done = 0
                while (< done n)
                do (let* ((chunk (subseq ids done (min n (+ done step)))) (k (length chunk)))
@@ -131,6 +171,10 @@
                                (sb-sys:with-pinned-objects (all)
                                  (il::cuda-download x (sb-sys:sap+ (sb-sys:vector-sap all) (* 4 done d)) (* 4 k d)))
                                (il::cuda-sync (il::cmodel-dev gpu)))))
+                          #+(and sbcl darwin)
+                          (gpu
+                           (il::dense-forward-n ctx (coerce chunk 'list) nil)
+                           (replace all (get-floats (il::dctx-x (il::dense-state ctx)) (* k d)) :start1 (* done d)))
                           (t
                            (il::forward-batch ctx chunk :logits nil)
                            (replace all (il::batch-scratch-x (il::batch-scratch ctx)) :start1 (* done d) :end2 (* k d))))

@@ -29,15 +29,15 @@
 
 (defun load-engine (&key (dit (weight-file "dit-q8_0.gguf")) (vae (weight-file "vae.safetensors"))
                          (encoder (weight-file "te-q8_0.gguf")) (vision (weight-file "mmproj-f16.gguf"))
-                         (device 0) (encoder-device #+darwin nil #-darwin 1))
+                         (device 0) (encoder-device #+darwin t #-darwin 1))
   "The models: the DiT and decoder on CUDA device DEVICE (on a Mac, its
-   GPU), the encoder on ENCODER-DEVICE (NIL: the CPU, as on a Mac), and
-   beside it, when the encoder is on a GPU and the file VISION is there, the
-   vision tower that editing wants."
+   GPU), the encoder on ENCODER-DEVICE (NIL: the CPU; on a Mac, true: the
+   GPU), and beside it, when the encoder is on a GPU and the file VISION is
+   there, the vision tower that editing wants."
   (%make-engine :encoder (load-encoder encoder :device encoder-device) :dit (upload-dit dit :device device)
                 :vae (upload-vae vae :device device)
                 :vision (and encoder-device vision (probe-file vision)
-                             #+(and sbcl linux) (load-vision vision :device encoder-device))))
+                             #+(and sbcl (or linux darwin)) (load-vision vision :device encoder-device))))
 
 (defun gaussian-noise (n seed)
   "N standard normal floats from SEED (Box-Muller over SBCL's generator)."

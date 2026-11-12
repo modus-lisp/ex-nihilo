@@ -178,6 +178,10 @@
         (put-floats cs (rope-table (nthcdr n0 (dit-positions p h w (and ref (list a (third ref) (fourth ref)))))))
         (unless cached
           (put-floats (b :ctx (* ptext wd)) context))
+        (when (and ref (not cached))   ; the picture's latent, a row of 64 a pixel
+          (let ((rows (f32vec (* nref 64))) (rl (second ref)))
+            (dotimes (ch 64) (dotimes (i nref) (setf (aref rows (+ (* i 64) ch)) (aref rl (+ (* ch nref) i)))))
+            (put-floats (b :ri (* nref 64)) rows)))
         (il::with-gpu-work (e gpu)
           ;; the timestep: t and 0 through the embedder, SiLU, the shared modulation
           (mm d e "time_text_embed.timestep_embedder.linear_1.weight" emb e1 2)
@@ -193,7 +197,11 @@
               (mm d e "txt_in.in_layer.weight" t1 hh ptext)
               (elementwise d e "x_gelu_tanh" (* ptext wd) '() (list hh))
               (cond ((null ref) (mm d e "txt_in.out_layer.weight" hh x ptext))
-                    (t (error "editing a picture is not on Metal yet")))))
+                    (t ;; text before the picture, the picture through img_in, the text after
+                     (mm d e "txt_in.out_layer.weight" hh c ptext)
+                     (copy-words d e c x (* a wd))
+                     (copy-words d e (at c (* 4 a wd)) (at x (* 4 (+ a nref) wd)) (* (- ptext a) wd))
+                     (mm d e "img_in.weight" (b :ri (* nref 64)) (at x (* 4 a wd)) nref)))))
           (mm d e "img_in.weight" img (at x (* 4 (- p n0) wd)) nimg))
         (when *dit-trace*
           (format *error-output* "~&before:")

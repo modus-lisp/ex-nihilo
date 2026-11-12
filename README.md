@@ -110,14 +110,16 @@ The last is the vision tower, for editing; without it (or with the encoder on
 the CPU) pictures are only repainted.
 
 **On a Mac** (Apple silicon; tested on a 48 GB M4 Pro), the same files go in
-`~/models/exn` (the default there), the DiT and decoder run on the GPU through
-Metal and the prompt encoder on the CPU:
+`~/models/exn` (the default there), and everything runs on the GPU through
+Metal -- the DiT, the decoder, and the prompt encoder and vision tower
+(illatio's Metal path for the dense models), so editing works too:
 
 | | 512x512 | 1024x1024 |
 |---|---|---|
 | eight steps | 19.6 s | 83.6 s |
 | decoding | 1 s | 4 s |
 | the whole picture, prompt to pixels | 20.7 s | 87.7 s |
+| an edit (the picture beside the new one doubles the DiT's sequence) | 24 s | 121 s |
 
 (From a cool start.  The steps' products run near the GPU's limit, and a
 long run is held by its power: eight steps in a row take about 10% longer
@@ -127,7 +129,9 @@ The DiT's Q8_0 matrices are read where they lie in the mapped file (illatio's
 `d4_mm_q8_0`, half products summed in floats), its attention is a flash
 attention on the half simdgroup matrices (`src/metal/exn.metal`), and the
 decoder's convolutions are half products summed in floats too (a picture
-within 3 of 255 of the decoder in floats, 78 dB).  `inspect/metal-kernels-test.lisp` checks the kernels
+within 3 of 255 of the decoder in floats, 78 dB).  The vision tower runs in
+floats; `inspect/metal-vision-check.lisp` holds it against
+`inspect/ref_vision.py` (5e-6).  `inspect/metal-kernels-test.lisp` checks the kernels
 against plain Lisp.
 
 `bin/ex-nihilo` serves OpenAI's image API on loopback (no authentication):
@@ -178,7 +182,6 @@ the same architecture with its refusal direction projected out.
 
 ## Not yet
 
-Editing on a Mac (it wants the prompt encoder on the GPU, which illatio's
-Metal side does not run yet), LoRAs, more than one picture to edit at once.
+LoRAs, more than one picture to edit at once.
 
 MIT licensed.

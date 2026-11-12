@@ -540,3 +540,71 @@ kernel void x_conv_h(constant x_conv_args & a [[buffer(0)]], device const float 
 typedef decltype(x_conv_h<16>) x_conv_h_t;
 template [[host_name("x_conv_h16")]] kernel x_conv_h_t x_conv_h<16>;
 template [[host_name("x_conv_h32")]] kernel x_conv_h_t x_conv_h<32>;
+
+// --- Qwen3-VL's vision tower (metal-vision.lisp; qvision.cu) ------------------------
+
+struct x_ln_args { uint width; float eps; };
+
+// Y = LayerNorm(X) * W + B, a row a threadgroup
+kernel void x_layernorm(constant x_ln_args & a [[buffer(0)]], device const float * x [[buffer(1)]],
+                        device const float * w [[buffer(2)]], device const float * b [[buffer(3)]],
+                        device float * y [[buffer(4)]],
+                        uint t [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+                        ushort ntg [[threads_per_threadgroup]]) {
+    threadgroup float red[32];
+    device const float * r = x + (ulong)t * a.width;
+    device float * o = y + (ulong)t * a.width;
+    float s = 0.f;
+    for (uint i = tid; i < a.width; i += ntg) s += r[i];
+    const float mean = x_tg_sum(s, red, tid, ntg) / (float)a.width;
+    float v = 0.f;
+    for (uint i = tid; i < a.width; i += ntg) { const float e = r[i] - mean; v += e * e; }
+    const float inv = rsqrt(x_tg_sum(v, red, tid, ntg) / (float)a.width + a.eps);
+    for (uint i = tid; i < a.width; i += ntg) o[i] = (r[i] - mean) * inv * w[i] + b[i];
+}
+
+struct x_heads_args { uint n; uint np; uint nh; uint hd; uint hdp; };
+
+// qvision.cu's q3v_heads: QKV's rows apart into heads, Q and K turned by the
+// 2-D rotary (rotate_half), rows HDP long (zeros past HD); V transposed, a
+// head's HD rows NP long.  grid (n, nh), threads 128.
+kernel void x_q3v_heads(constant x_heads_args & a [[buffer(0)]], device const float * qkv [[buffer(1)]],
+                        device const float * cs [[buffer(2)]], device float * q [[buffer(3)]],
+                        device float * k [[buffer(4)]], device float * vt [[buffer(5)]],
+                        uint2 tg [[threadgroup_position_in_grid]], uint2 lt [[thread_position_in_threadgroup]],
+                        uint2 nt [[threads_per_threadgroup]]) {
+    const uint t = tg.x, h = tg.y, half_ = a.hd / 2, d = a.nh * a.hd;
+    device const float * row = qkv + (ulong)t * 3 * d;
+    device const float * c = cs + (ulong)t * 2 * a.hd;
+    for (uint j = lt.x; j < a.hdp; j += nt.x) {
+        float qv = 0.f, kv = 0.f;
+        if (j < a.hd) {
+            device const float * qr = row + h * a.hd;
+            device const float * kr = row + d + h * a.hd;
+            const float rq = j < half_ ? -qr[j + half_] : qr[j - half_];
+            const float rk = j < half_ ? -kr[j + half_] : kr[j - half_];
+            qv = qr[j] * c[j] + rq * c[a.hd + j];
+            kv = kr[j] * c[j] + rk * c[a.hd + j];
+            vt[((ulong)h * a.hd + j) * a.np + t] = row[2 * d + h * a.hd + j];
+        }
+        q[((ulong)h * a.n + t) * a.hdp + j] = qv;
+        k[((ulong)h * a.n + t) * a.hdp + j] = kv;
+    }
+}
+
+// erf, Abramowitz and Stegun 7.1.26 (|error| < 1.5e-7): Metal's library has none
+static inline float x_erf(float x) {
+    const float s = sign(x), ax = fabs(x);
+    const float t = 1.f / (1.f + 0.3275911f * ax);
+    const float y = 1.f - (((((1.061405429f * t - 1.453152027f) * t) + 1.421413741f) * t - 0.284496736f) * t
+                            + 0.254829592f) * t * precise::exp(-ax * ax);
+    return s * y;
+}
+
+// X = gelu(X), the erf form
+kernel void x_gelu_erf(constant x_n_args & a [[buffer(0)]], device float * x [[buffer(1)]],
+                       uint i [[thread_position_in_grid]]) {
+    if (i >= a.count) return;
+    const float v = x[i];
+    x[i] = 0.5f * v * (1.f + x_erf(v * 0.7071067811865476f));
+}
