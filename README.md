@@ -1,10 +1,10 @@
 # ex-nihilo
 
 Pictures **out of nothing**, in Common Lisp: Qwen-Image-2.1-Turbo's prompt
-encoder, diffusion transformer and decoder, run by SBCL and a few CUDA
-kernels -- no Python, no PyTorch. A sibling of
+encoder, diffusion transformer and decoder, run by SBCL and a few CUDA or
+Metal kernels -- no Python, no PyTorch. A sibling of
 [illatio](https://github.com/modus-lisp/illatio), on its GGUF reader, its
-CUDA layer and its devices.
+CUDA and Metal layers and its devices.
 
 *Ex nihilo*, Latin: "out of nothing" -- a picture from pure noise.
 
@@ -109,6 +109,22 @@ beside this directory. The weights, about 18 GB:
 The last is the vision tower, for editing; without it (or with the encoder on
 the CPU) pictures are only repainted.
 
+**On a Mac** (Apple silicon; tested on a 48 GB M4 Pro), the same files go in
+`~/models/exn` (the default there), the DiT and decoder run on the GPU through
+Metal and the prompt encoder on the CPU:
+
+| | 512x512 | 1024x1024 |
+|---|---|---|
+| eight steps | 20 s | 91 s |
+| decoding | 2 s | 10 s |
+| the whole picture, prompt to pixels | 22 s | 101 s |
+
+The DiT's Q8_0 matrices are read where they lie in the mapped file (illatio's
+`d4_mm_q8_0`, half products summed in floats), its attention is a flash
+attention on the half simdgroup matrices (`src/metal/exn.metal`), and the
+decoder runs in floats.  `inspect/metal-kernels-test.lisp` checks the kernels
+against plain Lisp.
+
 `bin/ex-nihilo` serves OpenAI's image API on loopback (no authentication):
 
     bin/ex-nihilo [--port 9940] [--weights /mnt/ollama/exn] [--encoder FILE] [--device 0] [--encoder-device 1|cpu]
@@ -157,7 +173,7 @@ the same architecture with its refusal direction projected out.
 
 ## Not yet
 
-Apple Silicon (the design is sized for a 48 GB MacBook Pro; the kernels are
-CUDA so far), LoRAs, more than one picture to edit at once.
+Editing on a Mac (it wants the prompt encoder on the GPU, which illatio's
+Metal side does not run yet), LoRAs, more than one picture to edit at once.
 
 MIT licensed.

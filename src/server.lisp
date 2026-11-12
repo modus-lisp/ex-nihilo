@@ -238,7 +238,7 @@ $('go').onclick=go; $('p').onkeydown=e=>{if(e.key==='Enter'&&(e.metaKey||e.ctrlK
 (defun main (args)
   "bin/ex-nihilo: [--host H] [--port P] [--weights DIR] [--encoder FILE] [--device N] [--encoder-device N|cpu]
    --encoder replaces DIR's te-q8_0.gguf with another Qwen3-VL-8B GGUF, e.g. a fine-tune."
-  (let ((host "127.0.0.1") (port 9940) (dir "/mnt/ollama/exn/") (encoder nil) (device 0) (encoder-device 1))
+  (let ((host "127.0.0.1") (port 9940) (dir (namestring *weights*)) (encoder nil) (device 0) (encoder-device #+darwin nil #-darwin 1))
     (handler-case
      (loop while args
           do (let ((flag (pop args)) (v (pop args)))

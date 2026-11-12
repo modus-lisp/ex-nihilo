@@ -27,12 +27,13 @@
   vision                                      ; Qwen3-VL's vision tower, for editing; or NIL
   (prompts (make-hash-table :test 'equal)))   ; prompt -> (states . p), the last few
 
-(defun load-engine (&key (dit "/mnt/ollama/exn/dit-q8_0.gguf") (vae "/mnt/ollama/exn/vae.safetensors")
-                         (encoder "/mnt/ollama/exn/te-q8_0.gguf") (vision "/mnt/ollama/exn/mmproj-f16.gguf")
-                         (device 0) (encoder-device 1))
-  "The models: the DiT and decoder on CUDA device DEVICE, the encoder on
-   ENCODER-DEVICE (NIL: the CPU), and beside it, when the encoder is on a
-   GPU and the file VISION is there, the vision tower that editing wants."
+(defun load-engine (&key (dit (weight-file "dit-q8_0.gguf")) (vae (weight-file "vae.safetensors"))
+                         (encoder (weight-file "te-q8_0.gguf")) (vision (weight-file "mmproj-f16.gguf"))
+                         (device 0) (encoder-device #+darwin nil #-darwin 1))
+  "The models: the DiT and decoder on CUDA device DEVICE (on a Mac, its
+   GPU), the encoder on ENCODER-DEVICE (NIL: the CPU, as on a Mac), and
+   beside it, when the encoder is on a GPU and the file VISION is there, the
+   vision tower that editing wants."
   (%make-engine :encoder (load-encoder encoder :device encoder-device) :dit (upload-dit dit :device device)
                 :vae (upload-vae vae :device device)
                 :vision (and encoder-device vision (probe-file vision)
@@ -67,7 +68,7 @@
 (defun normalized-latent (e px width height)
   "PX (RGBA floats, WIDTH x HEIGHT) encoded, each channel normalized."
   (let* ((x (prog1 (vae-encode (engine-vae e) px height width)
-              #+(and sbcl linux) (vae-release (engine-vae e))))
+              #+(and sbcl (or linux darwin)) (vae-release (engine-vae e))))
          (n (floor (length x) 64)))
     (dotimes (c 64 x)
       (let ((m (float (aref +latent-mean+ c) 1f0)) (sd (float (aref +latent-std+ c) 1f0)))
@@ -98,13 +99,13 @@
       (decode-latent e z h w verbose #'elapsed))))
 
 (defun decode-latent (e z h w verbose elapsed)
-  #+(and sbcl linux) (dit-release (engine-dit e))
+  #+(and sbcl (or linux darwin)) (dit-release (engine-dit e))
   (let ((n (* h w)))
     (dotimes (c 64)
       (let ((m (float (aref +latent-mean+ c) 1f0)) (sd (float (aref +latent-std+ c) 1f0)))
         (dotimes (i n) (setf (aref z (+ (* c n) i)) (+ m (* sd (aref z (+ (* c n) i))))))))
     (multiple-value-bind (px ph pw) (vae-decode (engine-vae e) z h w)
-      #+(and sbcl linux) (vae-release (engine-vae e))
+      #+(and sbcl (or linux darwin)) (vae-release (engine-vae e))
       (when verbose (format *error-output* "ex-nihilo: decoded, ~,1Fs~%" (funcall elapsed)))
       (values px pw ph))))
 

@@ -17,9 +17,12 @@
      (:file "safetensors")   ; the decoder's weights: a JSON header and raw tensors
      (:file "weights")       ; the three files opened and checked against the model's shape
      (:file "encoder")       ; the prompt: Qwen3-VL's text model, its last block's states
+     (:file "host")          ; the host's share of a step, either GPU's
      (:file "cuda-dit" :if-feature (:and :sbcl :linux))   ; the DiT on an NVIDIA GPU (kernels: src/cuda/)
      (:file "cuda-vae" :if-feature (:and :sbcl :linux))   ; the decoder there
      (:file "cuda-vision" :if-feature (:and :sbcl :linux)) ; Qwen3-VL's vision tower, for editing
+     (:file "metal-dit" :if-feature (:and :sbcl :darwin))  ; the DiT on Apple silicon (kernels: src/metal/)
+     (:file "metal-vae" :if-feature (:and :sbcl :darwin))  ; the decoder there
      (:file "generate")))))  ; noise, eight steps, the decoder: a PNG
 
 (defsystem "ex-nihilo/server"

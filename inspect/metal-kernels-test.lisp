@@ -1,0 +1,152 @@
+;;;; metal-kernels-test.lisp — src/metal/exn.metal's kernels against plain
+;;;; Lisp, on small random inputs (sizes past a tile, not multiples of one).
+;;;;
+;;;;   sbcl --dynamic-space-size 8192 --non-interactive --load inspect/metal-kernels-test.lisp
+;;;;
+;;;; The attention takes halves, so its reference takes the same halves and
+;;;; sums in doubles; the bound is half's rounding of P (about 1e-3 of an
+;;;; output's size).  The convolutions are floats both ways.
+
+(require :asdf)
+(push (merge-pathnames "../" (make-pathname :name nil :type nil :defaults *load-truename*)) asdf:*central-registry*)
+(push (merge-pathnames "../../illatio/" (make-pathname :name nil :type nil :defaults *load-truename*)) asdf:*central-registry*)
+(handler-bind ((warning #'muffle-warning)) (asdf:load-system "ex-nihilo"))
+(in-package #:ex-nihilo)
+
+(defvar *failures* 0)
+(defun check (name err bound)
+  (format t "~:[FAIL~;ok  ~]  ~A: max error ~,2E (bound ~,1E)~%" (<= err bound) name err bound)
+  (unless (<= err bound) (incf *failures*)))
+
+(defvar *rs* (sb-ext:seed-random-state 7))
+(defun rnd (n &optional (scale 1.0)) (let ((v (f32vec n))) (dotimes (i n v) (setf (aref v i) (* scale (- (random 2.0 *rs*) 1.0))))))
+(defun as-half (v) (map 'f32vec (lambda (x) (il::half-to-single (il::single-to-half x))) v))
+
+(defun run (kernel args buffers groups threads &key (shared 0))
+  (let ((gpu (exn-gpu)))
+    (il::with-gpu-work (e gpu) (il::dispatch gpu e kernel args buffers groups threads :shared shared))))
+
+;;; --- attention ------------------------------------------------------------------
+
+(defun x-lim (g p l b0 b1) (cond ((>= g p) (1- l)) ((and (>= g b0) (< g b1)) (1- b1)) (t g)))
+
+(defun test-attention (name n q0 p l b0 b1)
+  (let* ((gpu (exn-gpu)) (wd 4096) (scale (/ 1.0 (sqrt 128.0)))
+         (q (as-half (rnd (* n wd) 2.0))) (k (as-half (rnd (* l wd) 2.0))) (v (as-half (rnd (* l wd))))
+         (qb (half-buffer gpu q)) (kb (half-buffer gpu k)) (vb (half-buffer gpu v))
+         (ob (il::gpu-buffer gpu (* 4 n wd))) (err 0d0))
+    (run "x_attend_h" (list n q0 p l b0 b1 scale) (list qb kb vb ob) (list 32 (ceiling n 32)) 128 :shared 32768)
+    (let ((out (get-floats ob (* n wd))))
+      (dolist (h '(0 7 31))
+        (dotimes (tq n)
+          (let* ((lim (x-lim (+ q0 tq) p l b0 b1)) (s (make-array (1+ lim) :element-type 'double-float)) (mx -1d300))
+            (dotimes (j (1+ lim))
+              (setf (aref s j) (* scale (loop for c below 128 sum (* (aref q (+ (* tq wd) (* h 128) c))
+                                                                    (aref k (+ (* j wd) (* h 128) c))) double-float)))
+              (setf mx (max mx (aref s j))))
+            (let ((sum 0d0))
+              (dotimes (j (1+ lim)) (setf (aref s j) (exp (- (aref s j) mx))) (incf sum (aref s j)))
+              (dotimes (c 128)
+                (let ((want (/ (loop for j to lim sum (* (aref s j) (aref v (+ (* j wd) (* h 128) c))) double-float) sum)))
+                  (setf err (max err (abs (- want (aref out (+ (* tq wd) (* h 128) c))))))))))))
+      (check name err 3d-3))))
+
+;;; --- convolutions ---------------------------------------------------------------
+
+(defun test-conv (name cin cout hh ww taps stride)
+  (let* ((gpu (exn-gpu)) (oh (if (= stride 2) (floor hh 2) hh)) (ow (if (= stride 2) (floor ww 2) ww))
+         (wt (rnd (* cout taps cin))) (bias (rnd cout)) (x (rnd (* hh ww cin)))
+         (yb (il::gpu-buffer gpu (* 4 oh ow cout))) (err 0d0) (size 0d0))
+    (run "x_conv" (list cin cout hh ww taps stride cin cout 1)
+         (list (put-floats (il::gpu-buffer gpu (* 4 (length wt))) wt) (put-floats (il::gpu-buffer gpu (* 4 cout)) bias)
+               (put-floats (il::gpu-buffer gpu (* 4 (length x))) x) yb)
+         (list (ceiling (* oh ow) 64) (ceiling cout 64)) 256)
+    (let ((y (get-floats yb (* oh ow cout))))
+      (dotimes (py oh)
+        (dotimes (px ow)
+          (dotimes (r cout)
+            (let ((want (aref bias r)))
+              (dotimes (tap taps)
+                (multiple-value-bind (sy sx)
+                    (cond ((= taps 1) (values py px))
+                          ((= stride 2) (values (+ (* 2 py) (floor tap 3)) (+ (* 2 px) (mod tap 3))))
+                          (t (values (+ py (floor tap 3) -1) (+ px (mod tap 3) -1))))
+                  (when (and (<= 0 sy (1- hh)) (<= 0 sx (1- ww)))
+                    (dotimes (ci cin)
+                      (incf want (* (aref wt (+ (* r taps cin) (* tap cin) ci))
+                                    (aref x (+ (* (+ (* sy ww) sx) cin) ci))))))))
+              (setf size (max size (abs want))
+                    err (max err (abs (- want (aref y (+ (* (+ (* py ow) px) cout) r))))))))))
+      (check name (/ err size) 1d-5))))
+
+;;; --- the reductions: norms and softmax -----------------------------------------------
+
+(defun buf (v) (put-floats (il::gpu-buffer (exn-gpu) (* 4 (max 1 (length v)))) v))
+
+(defun max-rel (want got)
+  (let ((err 0d0) (size 0d0))
+    (dotimes (i (length want) (/ err (max size 1d-30)))
+      (setf size (max size (abs (aref want i))) err (max err (abs (- (aref want i) (aref got i))))))))
+
+(defun test-ln-mod ()
+  ;; rows N0 + t below P take MOD's second row
+  (let* ((wd 4096) (n 9) (n0 3) (p 6) (x (rnd (* n wd) 50.0)) (mod (rnd (* 2 wd))) (want (f32vec (* n wd))))
+    (dotimes (tq n)
+      (let* ((row (subseq x (* tq wd) (* (1+ tq) wd)))
+             (mean (/ (reduce #'+ row) wd))
+             (var (/ (loop for v across row sum (expt (- v mean) 2)) wd))
+             (inv (/ 1 (sqrt (+ var 1e-6)))) (m (if (< (+ n0 tq) p) wd 0)))
+        (dotimes (i wd) (setf (aref want (+ (* tq wd) i)) (* (- (aref row i) mean) inv (+ 1 (aref mod (+ m i))))))))
+    (let ((yb (il::gpu-buffer (exn-gpu) (* 4 n wd))))
+      (run "x_ln_mod" (list wd n n0 p wd) (list (buf x) (buf mod) yb) n 256)
+      (check "LayerNorm, modulated" (max-rel want (get-floats yb (* n wd))) 1d-5))))
+
+(defun test-rms ()
+  (let* ((wd 3072) (n 5) (x (rnd (* n wd) 100.0)) (w (rnd wd)) (want (f32vec (* n wd))))
+    (dotimes (tq n)
+      (let ((inv (/ 1 (sqrt (+ (/ (loop for i below wd sum (expt (aref x (+ (* tq wd) i)) 2)) wd) 1e-6)))))
+        (dotimes (i wd) (setf (aref want (+ (* tq wd) i)) (* (aref x (+ (* tq wd) i)) inv (aref w i))))))
+    (let ((yb (il::gpu-buffer (exn-gpu) (* 4 n wd))))
+      (run "x_rms" (list wd 1e-6) (list (buf x) (buf w) yb) n 256)
+      (check "RMSNorm" (max-rel want (get-floats yb (* n wd))) 1d-5))))
+
+(defun test-qk-norm-rope ()
+  (let* ((n 3) (x (rnd (* n 4096) 30.0)) (w (rnd 128)) (cs (rnd (* n 128))) (want (f32vec (* n 4096))))
+    (dotimes (tq n)
+      (dotimes (h 32)
+        (let* ((o (+ (* tq 4096) (* h 128)))
+               (inv (/ 1 (sqrt (+ (/ (loop for i below 128 sum (expt (aref x (+ o i)) 2)) 128) 1e-6)))))
+          (dotimes (j 64)
+            (let ((an (* (aref x (+ o (* 2 j))) inv (aref w (* 2 j))))
+                  (bn (* (aref x (+ o (* 2 j) 1)) inv (aref w (1+ (* 2 j)))))
+                  (c (aref cs (+ (* tq 128) (* 2 j)))) (sn (aref cs (+ (* tq 128) (* 2 j) 1))))
+              (setf (aref want (+ o (* 2 j))) (- (* an c) (* bn sn))
+                    (aref want (+ o (* 2 j) 1)) (+ (* an sn) (* bn c))))))))
+    (let ((hb (il::gpu-buffer (exn-gpu) (* 2 n 4096))) (got (f32vec (* n 4096))))
+      (run "x_qk_norm_rope_h" (list n) (list (buf w) (buf cs) (buf x) hb) (list n 32) 64)
+      (dotimes (i (* n 4096)) (setf (aref got i) (il::half-to-single (sb-sys:sap-ref-16 (il::gbuf-sap hb) (* 2 i)))))
+      (check "QK norm and RoPE, to halves" (max-rel want got) 2d-3))))
+
+(defun test-softmax-rows ()
+  (let* ((n 4) (cols 1000) (stride 1008) (scale 0.3) (s (rnd (* n stride) 20.0)) (want (f32vec (* n stride))))
+    (dotimes (tq n)
+      (let* ((o (* tq stride)) (mx (loop for i below cols maximize (aref s (+ o i))))
+             (sum (loop for i below cols sum (exp (* scale (- (aref s (+ o i)) mx))))))
+        (dotimes (i cols) (setf (aref want (+ o i)) (/ (exp (* scale (- (aref s (+ o i)) mx))) sum)))))
+    (let ((sb (buf s)))
+      (run "x_softmax_rows" (list n cols stride scale) (list sb) n 256)
+      (check "softmax rows (and their padding zeroed)" (max-rel want (get-floats sb (* n stride))) 1d-5))))
+
+(test-ln-mod)
+(test-rms)
+(test-qk-norm-rope)
+(test-softmax-rows)
+(test-attention "attention, a first pass (prompt causal, image all)" 77 0 20 77 20 20)
+(test-attention "attention, the image after a cached prompt" 70 33 33 103 33 33)
+(test-attention "attention, a reference picture in the prompt" 90 0 40 90 12 30)
+(test-conv "conv 3x3" 32 48 7 9 9 1)
+(test-conv "conv 3x3, stride 2" 16 70 8 10 9 2)
+(test-conv "conv 1x1 (a product)" 40 33 5 13 1 1)
+
+(format t "~:[~D FAILED~;all passed~*~]~%" (zerop *failures*) *failures*)
+(sb-ext:exit :code (if (zerop *failures*) 0 1))

@@ -132,49 +132,6 @@
 (defun elementwise (d kernel count &rest args)
   (il::launch (gdit-dev d) kernel (ceiling count 256) 256 (list* (list :i64 count) args)))
 
-(defun timestep-embedding (tt &optional (dim 256) (period 10000d0))
-  "cos then sin of TT times each of DIM/2 frequencies (ggml_timestep_embedding)."
-  (let* ((half (floor dim 2)) (v (f32vec dim)))
-    (dotimes (j half v)
-      (let ((a (* tt (exp (/ (* (- (log period)) j) half)))))
-        (setf (aref v j) (coerce (cos a) 'single-float)
-              (aref v (+ j half)) (coerce (sin a) 'single-float))))))
-
-(defparameter +rope-axes+ '(16 56 56))
-
-(defun rope-table (positions)
-  "cos, sin of each token's 64 angles (POSITIONS: a list of (a b c)), 128 floats a token."
-  (let ((v (f32vec (* 128 (length positions)))))
-    (loop for pos in positions for tk from 0
-          do (let ((j 0))
-               (loop for d in +rope-axes+ for p in pos
-                     do (loop for i below (floor d 2)
-                              do (let ((ang (* p (/ 1d0 (expt 10000d0 (/ (* 2 i) d))))))
-                                   (setf (aref v (+ (* tk 128) (* 2 j))) (coerce (cos ang) 'single-float)
-                                         (aref v (+ (* tk 128) (* 2 j) 1)) (coerce (sin ang) 'single-float))
-                                   (incf j))))))
-    v))
-
-(defun image-positions (frame h w)
-  "An H x W block's positions: FRAME, and its rows and columns centred on zero."
-  (loop for r below h
-        append (loop for c below w collect (list frame (- r (- h (floor h 2))) (- c (- w (floor w 2)))))))
-
-(defun dit-positions (p h w &optional ref)
-  "Every row's (frame row col): the prompt's text at (i, i, i), the H x W image
-   after it at the position reached, centred.  With REF, (A RH RW): the prompt
-   is A text rows, a RH x RW reference picture, then the rest of its P rows'
-   text; the picture's frame is A, and the text after it goes on from A +
-   max(RH, RW) (diffusers' QwenImage21Rope)."
-  (if (null ref)
-      (append (loop for i below p collect (list i i i)) (image-positions p h w))
-      (destructuring-bind (a rh rw) ref
-        (let* ((after (- p a (* rh rw))) (pos (+ a (max rh rw))))
-          (append (loop for i below a collect (list i i i))
-                  (image-positions a rh rw)
-                  (loop for i below after collect (let ((x (+ pos i))) (list x x x)))
-                  (image-positions (+ pos after) h w))))))
-
 ;;; --- a step -------------------------------------------------------------------------
 
 (defun dit-velocity (d context p latent h w sigma &key (prefix-key nil) ref)

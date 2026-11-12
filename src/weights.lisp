@@ -6,6 +6,14 @@
 
 ;;; --- the DiT: 32 single-stream blocks of 4096, no biases -----------------------
 
+(defparameter *weights*
+  #+darwin (merge-pathnames "models/exn/" (user-homedir-pathname))
+  #-darwin #p"/mnt/ollama/exn/"
+  "Where the weights are (README.md, Weights): the DiT, the decoder, the
+   prompt encoder and its vision tower.")
+
+(defun weight-file (name) (namestring (merge-pathnames name *weights*)))
+
 (defparameter +dit-prefix+ "model.diffusion_model.")
 
 (defstruct (dit-shape (:conc-name dit-))
@@ -138,8 +146,8 @@
 
 ;;; --- all three ------------------------------------------------------------------
 
-(defun check-weights (&key (dit "/mnt/ollama/exn/dit-q8_0.gguf") (vae "/mnt/ollama/exn/vae.safetensors")
-                           (encoder "/mnt/ollama/exn/te-q8_0.gguf"))
+(defun check-weights (&key (dit (weight-file "dit-q8_0.gguf")) (vae (weight-file "vae.safetensors"))
+                           (encoder (weight-file "te-q8_0.gguf")))
   "Open each file and report what it holds."
   (let ((g (open-dit dit)))
     (format t "DiT: ~D tensors as expected, ~,2F GB (~{~A~^, ~})~%"
