@@ -7,6 +7,9 @@
 //                                              WT: COUT rows of (ky, kx, ci); CIN a multiple of 16
 //   x_up2(c, h, w, x, y)                       Y (2H x 2W) = X, each pixel four times
 //   x_dupup_add(cin, cout, ft, h, w, x, y)     Y (2H x 2W x COUT) += DupUp3D(X) (H x W x CIN), frame FT-1 of FT
+//   x_conv3s2(cin, cout, h, w, wt, bias, x, y) Y (H/2 x W/2) = 3 x 3 convolution of X, stride 2, X padded
+//                                              by one pixel right and below only (the encoder's downsample)
+//   x_avgdown_add(cin, cout, ft, h, w, x, y)   Y (H/2 x W/2 x COUT) += AvgDown3D(X) (H x W x CIN), one frame
 //   x_split3(n, c, qkv, q, k, v)               QKV's rows (3C) apart into three N x C
 //   x_transpose(rows, cols, x, y)              Y (COLS x ROWS) = X^T
 //   x_softmax_rows(n, cols, scale, s)          each row of S: softmax(S * SCALE)
@@ -61,6 +64,79 @@ x_conv3(int cin, int cout, int h, int w, const float* __restrict__ wt, const flo
       if (r < cout) y[(long long)t * cout + r] = acc[i][j] + bias[r];
     }
   }
+}
+
+// x_conv3's tiles; H and W the input's (even), the output H/2 x W/2.
+extern "C" __global__ void __launch_bounds__(256)
+x_conv3s2(int cin, int cout, int h, int w, const float* __restrict__ wt, const float* __restrict__ bias,
+          const float* __restrict__ x, float* __restrict__ y) {
+  __shared__ float xs[16][64 + 4], ws[16][64 + 4];
+  const int ow = w / 2, n = (h / 2) * ow, ncols = 9 * cin;
+  const int t0 = blockIdx.x * 64, r0 = blockIdx.y * 64, tid = threadIdx.x;
+  const int tx = tid & 15, ty = tid >> 4;
+  const int lr = tid >> 2, lk = (tid & 3) * 4;
+  const int pix = t0 + lr, py = pix / ow, px = pix - py * ow;
+  float acc[4][4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i)
+#pragma unroll
+    for (int j = 0; j < 4; ++j) acc[i][j] = 0.f;
+  for (int k0 = 0; k0 < ncols; k0 += 16) {
+    const int tap = k0 / cin, ci = k0 - tap * cin + lk;
+    const int sy = 2 * py + tap / 3, sx = 2 * px + tap % 3;
+    float4 xv = make_float4(0.f, 0.f, 0.f, 0.f), wv = make_float4(0.f, 0.f, 0.f, 0.f);
+    if (pix < n && sy < h && sx < w)
+      xv = *(const float4*)(x + ((long long)sy * w + sx) * cin + ci);
+    if (r0 + lr < cout) wv = __ldg((const float4*)(wt + (long long)(r0 + lr) * ncols + k0 + lk));
+    xs[lk][lr] = xv.x; xs[lk + 1][lr] = xv.y; xs[lk + 2][lr] = xv.z; xs[lk + 3][lr] = xv.w;
+    ws[lk][lr] = wv.x; ws[lk + 1][lr] = wv.y; ws[lk + 2][lr] = wv.z; ws[lk + 3][lr] = wv.w;
+    __syncthreads();
+#pragma unroll
+    for (int k = 0; k < 16; ++k) {
+      const float4 a = *(const float4*)&xs[k][4 * ty], b = *(const float4*)&ws[k][4 * tx];
+      const float av[4] = {a.x, a.y, a.z, a.w}, bv[4] = {b.x, b.y, b.z, b.w};
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] = fmaf(av[i], bv[j], acc[i][j]);
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const int t = t0 + 4 * ty + i;
+    if (t >= n) continue;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int r = r0 + 4 * tx + j;
+      if (r < cout) y[(long long)t * cout + r] = acc[i][j] + bias[r];
+    }
+  }
+}
+
+// AvgDown3D on one frame, padded in front to FT frames with zeros: output
+// channel O of pixel (Y, X) is the mean of the G = CIN FT 4 / COUT values
+// J = O G .. O G + G - 1 of the view (CIN, FT, 2, 2): channel J / (4 FT),
+// frame (J / 4) % FT (the padding's zero but the last), row Y 2 + (J / 2) % 2,
+// column X 2 + J % 2.
+extern "C" __global__ void x_avgdown_add(int cin, int cout, int ft, int h, int w, const float* __restrict__ x,
+                                         float* __restrict__ y) {
+  const int ow = w / 2;
+  const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  const long long count = (long long)(h / 2) * ow * cout;
+  if (i >= count) return;
+  const int o = (int)(i % cout);
+  const long long p = i / cout;
+  const int yy = (int)(p / ow), xx = (int)(p % ow);
+  const int g = cin * ft * 4 / cout;
+  float s = 0.f;
+  for (int k = 0; k < g; ++k) {
+    const int j = o * g + k, f = (j >> 2) % ft;
+    if (f != ft - 1) continue;
+    const int c = j / (4 * ft), sy = 2 * yy + ((j >> 1) & 1), sx = 2 * xx + (j & 1);
+    s += x[((long long)sy * w + sx) * cin + c];
+  }
+  y[i] += s / g;
 }
 
 extern "C" __global__ void x_up2(int c, int h, int w, const float* __restrict__ x, float* __restrict__ y) {

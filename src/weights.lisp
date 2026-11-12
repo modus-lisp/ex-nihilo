@@ -89,10 +89,46 @@
       (conv "decoder.head.2" out (second (car (last stages))) 3))
     (nreverse r)))
 
+(defparameter +vae-enc-stages+
+  ;; (in out spatial-down temporal-down), the picture's end first: 1024 -> 64 pixels
+  '((96 96 t nil) (96 192 t t) (192 384 t t) (384 768 t t) (768 768 nil nil)))
+
+(defun vae-encoder-expected (&key (z 64) (in 4) (stages +vae-enc-stages+))
+  "(name . shape) of every tensor the encoder uses (a picture to a latent):
+   Wan 2.2's encoder, two residual blocks a stage, the mean and log-variance
+   out of its head, CONV1 after it."
+  (let ((top (second (car (last stages)))) (r '()))
+    (labels ((add (name &rest shape) (push (cons name shape) r))
+             (conv (name o i k &optional (frames t))
+               (if frames (add (format nil "~A.weight" name) o i 1 k k) (add (format nil "~A.weight" name) o i k k))
+               (add (format nil "~A.bias" name) o))
+             (res (p i o)
+               (add (format nil "~A.residual.0.gamma" p) i 1 1 1)
+               (conv (format nil "~A.residual.2" p) o i 3)
+               (add (format nil "~A.residual.3.gamma" p) o 1 1 1)
+               (conv (format nil "~A.residual.6" p) o o 3)
+               (unless (= i o) (conv (format nil "~A.shortcut" p) o i 1))))
+      (conv "encoder.conv1" (first (first stages)) in 3)
+      (loop for (i o down tdown) in stages for s from 0
+            do (dotimes (j 2)
+                 (res (format nil "encoder.downsamples.~D.downsamples.~D" s j) (if (zerop j) i o) o))
+               (when down
+                 (conv (format nil "encoder.downsamples.~D.downsamples.2.resample.1" s) o o 3 nil)
+                 (when tdown (conv (format nil "encoder.downsamples.~D.downsamples.2.time_conv" s) o o 1))))
+      (res "encoder.middle.0" top top)
+      (add "encoder.middle.1.norm.gamma" top 1 1)
+      (conv "encoder.middle.1.to_qkv" (* 3 top) top 1 nil)
+      (conv "encoder.middle.1.proj" top top 1 nil)
+      (res "encoder.middle.2" top top)
+      (add "encoder.head.0.gamma" top 1 1 1)
+      (conv "encoder.head.2" (* 2 z) top 3)
+      (conv "conv1" (* 2 z) (* 2 z) 1))
+    (nreverse r)))
+
 (defun open-vae (path)
   "The decoder's safetensors at PATH, every tensor it uses checked."
   (let ((st (read-safetensors path)) (problems '()))
-    (loop for (name . shape) in (vae-expected)
+    (loop for (name . shape) in (append (vae-expected) (vae-encoder-expected))
           for e = (gethash name (st-tensors st))
           do (cond ((null e) (push (format nil "missing ~A" name) problems))
                    ((not (equal (second e) shape))

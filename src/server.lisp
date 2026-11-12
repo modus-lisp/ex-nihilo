@@ -64,8 +64,29 @@
           (bad "size ~S: at most ~D pixels (1536x1024)" size +max-pixels+))
         (values w h))))
 
+(defun source-size (img)
+  "A picture's size for one made from IMG: its shape, its pixels or a
+   megapixel if fewer, each side a multiple of 16 from 256."
+  (let* ((sw (il::rgb-image-width img)) (sh (il::rgb-image-height img))
+         (k (sqrt (/ (min (* sw sh) (* 1024 1024)) (* sw sh))))
+         (w (max 256 (* 16 (round (* sw k) 16)))) (h (max 256 (* 16 (round (* sh k) 16)))))
+    (loop while (> (* w h) +max-pixels+) do (decf w 16) (decf h 16))
+    (values w h)))
+
+(defun request-source (req)
+  "REQ's source picture, \"image\": a data: URL or bare base64 (PNG, JPEG or
+   WebP), as illatio's RGB-IMAGE; or NIL."
+  (let ((v (il::jget req "image")))
+    (when v
+      (unless (stringp v) (bad "image must be a data: URL or base64 of a PNG, JPEG or WebP"))
+      (let ((comma (and (eql 0 (search "data:" v)) (position #\, v))))
+        (handler-case (il::decode-picture (il::base64-octets v :start (if comma (1+ comma) 0)))
+          (error (e) (bad "image: ~A" e)))))))
+
 (defun image-request (req)
-  "REQ's fields checked: (values prompt width height n seed format alpha)."
+  "REQ's fields checked: (values prompt width height n seed format alpha
+   source strength), SOURCE a picture to make one from (RGBA floats at the
+   size) or NIL."
   (let ((prompt (il::jget req "prompt")) (n (or (il::jget req "n") 1))
         (seed (il::jget req "seed")) (format (or (il::jget req "response_format") "b64_json"))
         (output (il::jget req "output_format")))
@@ -77,18 +98,22 @@
     (unless (member format '("b64_json" "url") :test #'equal)
       (bad "response_format must be \"b64_json\" or \"url\""))
     (unless (member output '(nil "png") :test #'equal) (bad "output_format: only \"png\""))
-    (multiple-value-bind (w h) (parse-size (il::jget req "size"))
-      (values prompt w h n (or seed (random (expt 2 32) (make-random-state t))) format
-              (equal (il::jget req "background") "transparent")))))
+    (let ((src (request-source req)) (strength (or (il::jget req "strength") 0.8)))
+      (unless (and (realp strength) (< 0 strength) (<= strength 1)) (bad "strength must be a number in (0, 1]"))
+      (multiple-value-bind (w h) (if (and src (null (il::jget req "size"))) (source-size src) (parse-size (il::jget req "size")))
+        (values prompt w h n (or seed (random (expt 2 32) (make-random-state t))) format
+                (equal (il::jget req "background") "transparent")
+                (and src (picture-floats src w h)) (float strength 1d0))))))
 
 (defun images-object (req)
-  (multiple-value-bind (prompt w h n seed format alpha) (image-request req)
+  (multiple-value-bind (prompt w h n seed format alpha source strength) (image-request req)
     (let* ((pngs (let ((made '()))      ; the n pictures in one turn on the GPU
                    (funcall *on-gpu*
                             (lambda ()
                               (dotimes (k n)
                                 (multiple-value-bind (px pw ph)
-                                    (generate *engine* prompt :width w :height h :seed (+ seed k))
+                                    (generate *engine* prompt :width w :height h :seed (+ seed k)
+                                                  :init source :strength strength)
                                   (push (list px pw ph) made)))))
                    (mapcar (lambda (m)
                              (destructuring-bind (px pw ph) m

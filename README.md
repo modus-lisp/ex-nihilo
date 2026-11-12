@@ -29,6 +29,14 @@ of 16 from 256 to 2048, at most 1536x1024's pixels), `n` (1-4),
 "seed"}]}`. `GET /` is a page to try it from a browser; `GET /v1/models` and
 `GET /health` as illatio's. Requests take turns on the GPU.
 
+A picture can be made from another: `image` (a `data:` URL or bare base64 of
+a PNG, JPEG or WebP) is encoded by the VAE's encoder, noised, and the steps run
+from there, the prompt describing the whole result. `strength` (0-1, default
+0.8) is the share of Turbo's eight steps that run: about 0.5 keeps the picture
+close, 0.8 restyles and relights it with its composition kept, 0.9 keeps only
+its layout, 1 ignores it. Without `size` the result takes the source's shape
+(up to a megapixel).
+
 In illatio's server instead, beside a chat model on the same GPUs:
 `bin/illatio-server -m CHAT-MODEL --gpu --images /mnt/ollama/exn` (illatio
 loads this system for the flag; `src/tenant.lisp`).  The two take turns: these

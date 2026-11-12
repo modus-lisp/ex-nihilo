@@ -1,7 +1,9 @@
-;;;; cuda-vae.lisp — the decoder on an NVIDIA GPU (docs/design.md, section 4):
-;;;; Wan 2.2's, one frame, every convolution 2-D.  Channels last: a picture
-;;;; is H x W rows of C floats.  Kernels: src/cuda/vae.cu, and illatio's
-;;;; d41_mm_f32 (the 1 x 1 convolutions), v_bias, v_rms.
+;;;; cuda-vae.lisp — the decoder (a latent to a picture) and the encoder (a
+;;;; picture to a latent, for a picture made from another) on an NVIDIA GPU
+;;;; (docs/design.md, section 4): Wan 2.2's, one frame, every convolution
+;;;; 2-D.  Channels last: a picture is H x W rows of C floats.  Kernels:
+;;;; src/cuda/vae.cu, and illatio's d41_mm_f32 (the 1 x 1 convolutions),
+;;;; v_bias, v_rms, v_add.
 
 (in-package #:ex-nihilo)
 
@@ -11,21 +13,23 @@
   (buf (make-hash-table)))              ; scratch: key -> (dbuf . floats)
 
 (defun upload-vae (path &key (device 0))
-  "The decoder in the safetensors at PATH on CUDA device DEVICE."
+  "The decoder and encoder in the safetensors at PATH on CUDA device DEVICE.
+   A 3 x 3 convolution's input channels are made a multiple of 16 (x_conv3's
+   tiles): the encoder's first, of RGBA, padded with zero weights."
   (let* ((st (open-vae path)) (dev (exn-device device)) (v (%make-gvae :dev dev)) (bytes 0))
     (il::with-cuda
       (il::cuda-current dev)
-      (loop for (name . shape) in (vae-expected)
+      (loop for (name . shape) in (append (vae-expected) (vae-encoder-expected))
             for f = (st-f32 st name)
-            do (when (and (= (length shape) 5) (= (fifth shape) 3)) ; (o i 1 3 3) -> o rows of (ky kx i)
+            do (when (and (= (length shape) 5) (= (fifth shape) 3)) ; (o i 1 3 3) -> o rows of (ky kx ip)
                  (destructuring-bind (o i one k k2) shape
                    (declare (ignore one k2))
-                   (let ((r (f32vec (length f))))
+                   (let* ((ip (* 16 (ceiling i 16))) (r (f32vec (* o 9 ip))))
                      (dotimes (co o)
                        (dotimes (ci i)
                          (dotimes (ky k)
                            (dotimes (kx k)
-                             (setf (aref r (+ (* co 9 i) (* (+ (* ky 3) kx) i) ci))
+                             (setf (aref r (+ (* co 9 ip) (* (+ (* ky 3) kx) ip) ci))
                                    (aref f (+ (* (+ (* co i) ci) 9) (* ky 3) kx)))))))
                      (setf f r))))
                (when (and (= (length shape) 4) (= (third shape) 3)) ; resample.1: (o i 3 3)
@@ -40,28 +44,15 @@
                (incf bytes (* 4 (length f)))
                (setf (gethash name (gvae-w v)) (il::cuda-upload-vector (il::cuda-alloc dev (* 4 (length f)) :zero nil) f)))
       (il::cuda-sync dev))
-    (format *error-output* "ex-nihilo: the decoder (~,2F GB as floats) on ~A~%" (/ bytes 1d9) (il::cudev-name dev))
+    (format *error-output* "ex-nihilo: the decoder and encoder (~,2F GB as floats) on ~A~%" (/ bytes 1d9) (il::cudev-name dev))
     v))
 
-(defun vae-sizes (h w)
-  "(values out in): the most floats a stage's output and a stage's input
-   (at its own size) take, for an H x W latent."
-  (let ((hh h) (ww w) (out (* h w (first (first +vae-stages+)))) (in 0))
-    (loop for (i o up) in +vae-stages+
-          do (setf in (max in (* hh ww (max i o))))
-             (when up (setf hh (* 2 hh) ww (* 2 ww)))
-             (setf out (max out (* hh ww o))))
-    (values out in)))
-
-(defun vae-decode (v latent h w)
-  "LATENT (64 x H x W floats, channel-major, denormalized) decoded: the
-   picture as 16H x 16W x 4 floats (RGBA, -1 .. 1), row-major, channels
-   last, and its height and width."
-  (let ((dev (gvae-dev v)))
-    (il::with-cuda
-      (il::cuda-current dev)
-      (multiple-value-bind (max-out max-in) (vae-sizes h w)
-        (labels ((wt (name) (or (gethash name (gvae-w v)) (error "no decoder tensor ~A" name)))
+;;; The building blocks both directions use, as local functions of the body:
+;;; WT, B (scratch by key), EW, CONV1, CONV3, CONV3S2, NORM-SILU, RESBLOCK,
+;;; ATTENTION.  MAX-IN: the floats a residual block's scratch must hold.
+(defmacro with-vae-ops ((v dev max-in) &body body)
+  `(let ((v ,v) (dev ,dev) (max-in ,max-in))
+        (labels ((wt (name) (or (gethash name (gvae-w v)) (error "no VAE tensor ~A" name)))
                  (b (key floats)
                    (let ((e (gethash key (gvae-buf v))))
                      (if (and e (>= (cdr e) floats)) (car e)
@@ -93,18 +84,43 @@
                            (t
                             (conv3 (format nil "~A.residual.6" p) t1 t2 o o hh ww)
                             (conv1 (format nil "~A.shortcut" p) x out i o n t2)))))
-                 (attention (x out c n)
+                 (attention (prefix x out c n)
                    ;; one head over the N pixels: S[t][r] = K[r].Q[t], softmax, A[t] = V^T . P[t]
                    (let ((t1 (b :at (* n c))) (qkv (b :qkv (* n 3 c))) (q (b :q (* n c))) (k (b :k (* n c)))
                          (vv (b :vv (* n c))) (vt (b :vt (* n c))) (s (b :s (* n n))))
-                     (il::launch dev "v_rms" n 256 (list c 1f-12 x (wt "decoder.middle.1.norm.gamma") t1))
-                     (conv1 "decoder.middle.1.to_qkv" t1 qkv c (* 3 c) n)
+                     (il::launch dev "v_rms" n 256 (list c 1f-12 x (wt (format nil "~A.norm.gamma" prefix)) t1))
+                     (conv1 (format nil "~A.to_qkv" prefix) t1 qkv c (* 3 c) n)
                      (ew "x_split3" (* n c) c qkv q k vv)
                      (il::launch dev "d41_mm_f32" (list (ceiling n 64) (ceiling n 64)) 256 (list c n n c n k q s))
                      (il::launch dev "x_softmax_rows" n 256 (list n n (coerce (/ (sqrt (float c 1d0))) 'single-float) s))
                      (il::launch dev "x_transpose" (list (ceiling c 32) (ceiling n 32)) '(32 8) (list n c vv vt))
                      (il::launch dev "d41_mm_f32" (list (ceiling n 64) (ceiling c 64)) 256 (list n c n n c vt s t1))
-                     (conv1 "decoder.middle.1.proj" t1 out c c n x))))
+                     (conv1 (format nil "~A.proj" prefix) t1 out c c n x)))
+                 (conv3s2 (name x y cin cout hh ww)
+                   (il::launch dev "x_conv3s2" (list (ceiling (* (floor hh 2) (floor ww 2)) 64) (ceiling cout 64)) 256
+                               (list cin cout hh ww (wt (format nil "~A.weight" name)) (wt (format nil "~A.bias" name)) x y))))
+          (declare (ignorable #'ew #'conv1 #'conv3 #'conv3s2 #'norm-silu #'resblock #'attention))
+          ,@body)))
+
+(defun vae-sizes (h w)
+  "(values out in): the most floats a stage's output and a stage's input
+   (at its own size) take, for an H x W latent."
+  (let ((hh h) (ww w) (out (* h w (first (first +vae-stages+)))) (in 0))
+    (loop for (i o up) in +vae-stages+
+          do (setf in (max in (* hh ww (max i o))))
+             (when up (setf hh (* 2 hh) ww (* 2 ww)))
+             (setf out (max out (* hh ww o))))
+    (values out in)))
+
+(defun vae-decode (v latent h w)
+  "LATENT (64 x H x W floats, channel-major, denormalized) decoded: the
+   picture as 16H x 16W x 4 floats (RGBA, -1 .. 1), row-major, channels
+   last, and its height and width."
+  (let ((dev (gvae-dev v)))
+    (il::with-cuda
+      (il::cuda-current dev)
+      (multiple-value-bind (max-out max-in) (vae-sizes h w)
+        (with-vae-ops (v dev max-in)
           (let* ((n (* h w)) (top (first (first +vae-stages+)))
                  (x (b :x max-out)) (y (b :y max-out)) (keep (b :keep max-in)) (u (b :u max-out))
                  (hh h) (ww w))
@@ -115,7 +131,7 @@
                 (conv1 "conv2" a u 64 64 n)
                 (conv3 "decoder.conv1" u x 64 top hh ww))
               (resblock "decoder.middle.0" x y top top hh ww) (swap)
-              (attention x y top n) (swap)
+              (attention "decoder.middle.1" x y top n) (swap)
               (resblock "decoder.middle.2" x y top top hh ww) (swap)
               (loop for (i o up tup) in +vae-stages+ for s from 0
                     do (let ((np (* hh ww)))
@@ -139,3 +155,58 @@
                     (il::cuda-download out (sb-sys:vector-sap px) (* 4 np 4)))
                   (il::cuda-sync dev)
                   (values px hh ww))))))))))
+
+(defun vae-enc-sizes (h w)
+  "(values out in) for the encoder on an H x W picture: the most floats a
+   stage's output and a stage's input (at its own size) take."
+  (let ((hh h) (ww w) (out (* h w (first (first +vae-enc-stages+)))) (in (* h w 16)))
+    (loop for (i o down) in +vae-enc-stages+
+          do (setf in (max in (* hh ww (max i o))) out (max out (* hh ww o)))
+             (when down (setf hh (floor hh 2) ww (floor ww 2))))
+    (values out in)))
+
+(defun vae-encode (v px h w)
+  "PX (H x W x 4 floats, RGBA in -1 .. 1, rows of W pixels; H and W multiples
+   of 16) encoded: the latent's mean, 64 x H/16 x W/16 floats channel-major,
+   as the decoder takes it (denormalized)."
+  (assert (and (zerop (mod h 16)) (zerop (mod w 16))))
+  (let ((dev (gvae-dev v)) (n (* h w)))
+    (il::with-cuda
+      (il::cuda-current dev)
+      (multiple-value-bind (max-out max-in) (vae-enc-sizes h w)
+        (with-vae-ops (v dev max-in)
+          (let ((x (b :x max-out)) (y (b :y max-out)) (keep (b :keep max-in)) (hh h) (ww w))
+            (macrolet ((swap () '(rotatef x y)))
+              ;; RGBA, padded to 16 channels (the first convolution's weights are, with zeros)
+              (let ((rows (f32vec (* n 16))) (a (b :a (* n 16))))
+                (dotimes (i n) (dotimes (c 4) (setf (aref rows (+ (* i 16) c)) (aref px (+ (* i 4) c)))))
+                (il::cuda-upload-vector a rows)
+                (conv3 "encoder.conv1" a x 16 (first (first +vae-enc-stages+)) hh ww))
+              ;; the stages: two residual blocks, a stride-2 convolution, and AvgDown3D's shortcut around them
+              (loop for (i o down tdown) in +vae-enc-stages+ for s from 0
+                    do (let ((np (* hh ww)))
+                         (il::cuda-copy-dd keep 0 x 0 (* 4 np i))
+                         (dotimes (j 2)
+                           (resblock (format nil "encoder.downsamples.~D.downsamples.~D" s j) x y (if (zerop j) i o) o hh ww)
+                           (swap))
+                         (cond (down
+                                (conv3s2 (format nil "encoder.downsamples.~D.downsamples.2.resample.1" s) x y o o hh ww)
+                                (setf hh (floor hh 2) ww (floor ww 2))
+                                (il::launch dev "x_avgdown_add" (ceiling (* hh ww o) 256) 256
+                                            (list i o (if tdown 2 1) (* 2 hh) (* 2 ww) keep y))
+                                (swap))
+                               (t (assert (= i o)) (ew "v_add" (* np o) x keep)))))
+              (let* ((top (second (car (last +vae-enc-stages+)))) (np (* hh ww)))
+                (resblock "encoder.middle.0" x y top top hh ww) (swap)
+                (attention "encoder.middle.1" x y top np) (swap)
+                (resblock "encoder.middle.2" x y top top hh ww) (swap)
+                ;; the head: norm, SiLU, 3 x 3 to the mean and log-variance, CONV1
+                (norm-silu "encoder.head.0.gamma" x y top np)
+                (conv3 "encoder.head.2" y x top 128 hh ww)
+                (conv1 "conv1" x y 128 128 np)
+                (let ((rows (f32vec (* np 128))) (z (f32vec (* 64 np))))
+                  (sb-sys:with-pinned-objects (rows)
+                    (il::cuda-download y (sb-sys:vector-sap rows) (* 4 np 128)))
+                  (il::cuda-sync dev)
+                  (dotimes (c 64) (dotimes (i np) (setf (aref z (+ (* c np) i)) (aref rows (+ (* i 128) c)))))
+                  z)))))))))

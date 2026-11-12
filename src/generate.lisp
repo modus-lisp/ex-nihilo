@@ -49,13 +49,38 @@
              (setf (gethash prompt (engine-prompts e))
                    (multiple-value-bind (st p) (encode-prompt (engine-encoder e) prompt) (cons st p))))))
 
-(defun generate (e prompt &key (width 1024) (height 1024) (seed 0) (sigmas +turbo-sigmas+) (verbose t))
+(defun start-sigmas (sigmas strength)
+  "SIGMAS from where a picture made from another starts: STRENGTH (0 .. 1]
+   the share of the steps run (1: all, the source unused; at least one).
+   Not the noise level itself: Turbo's schedule spends most of its steps
+   above 0.85, and below that a source hardly changes -- even from 0.978 its
+   composition holds, the sky and light remade."
+  (let* ((steps (1- (length sigmas)))
+         (k (max 0 (min (1- steps) (round (* (- 1 strength) steps))))))
+    (nthcdr k sigmas)))
+
+(defun generate (e prompt &key (width 1024) (height 1024) (seed 0) (sigmas +turbo-sigmas+) (verbose t)
+                               init (strength 0.8))
   "The picture PROMPT asks for: (values rgba width height), RGBA floats in
-   -1 .. 1, rows of WIDTH pixels.  WIDTH and HEIGHT multiples of 16."
+   -1 .. 1, rows of WIDTH pixels.  WIDTH and HEIGHT multiples of 16.  With
+   INIT, a picture (RGBA floats as returned, WIDTH x HEIGHT), made from it:
+   INIT encoded, noised to the sigma START-SIGMAS picks for STRENGTH (flow
+   matching: (1 - s) x + s noise), the steps from there."
   (assert (and (zerop (mod width 16)) (zerop (mod height 16))))
   (let* ((t0 (get-internal-real-time)) (h (floor height 16)) (w (floor width 16)) (n (* h w))
          (z (gaussian-noise (* 64 n) seed)))
     (flet ((elapsed () (/ (- (get-internal-real-time) t0) internal-time-units-per-second)))
+      (when init
+        (assert (= (length init) (* 4 width height)))
+        (setf sigmas (start-sigmas sigmas strength))
+        (let ((x (vae-encode (engine-vae e) init height width)) (s (float (first sigmas) 1f0)))
+          (dotimes (c 64)
+            (let ((m (float (aref +latent-mean+ c) 1f0)) (sd (float (aref +latent-std+ c) 1f0)))
+              (dotimes (i n)
+                (let ((k (+ (* c n) i)))
+                  (setf (aref z k) (+ (* (- 1 s) (/ (- (aref x k) m) sd)) (* s (aref z k)))))))))
+        (when verbose (format *error-output* "ex-nihilo: the source encoded, from sigma ~,3F, ~,1Fs~%"
+                              (first sigmas) (elapsed))))
       (destructuring-bind (states . p) (prompt-states e prompt)
         (when verbose (format *error-output* "ex-nihilo: prompt, ~D tokens, ~,1Fs~%" p (elapsed)))
         (loop for (s s2) on sigmas while s2
@@ -68,6 +93,21 @@
         (multiple-value-bind (px ph pw) (vae-decode (engine-vae e) z h w)
           (when verbose (format *error-output* "ex-nihilo: decoded, ~,1Fs~%" (elapsed)))
           (values px pw ph))))))
+
+(defun picture-floats (img width height)
+  "IMG (illatio's RGB-IMAGE) as WIDTH x HEIGHT RGBA floats in -1 .. 1, opaque:
+   scaled to cover, the middle kept."
+  (let* ((sw (il::rgb-image-width img)) (sh (il::rgb-image-height img))
+         (k (max (/ width sw) (/ height sh)))
+         (dw (max width (round (* sw k)))) (dh (max height (round (* sh k))))
+         (ox (floor (- dw width) 2)) (oy (floor (- dh height) 2))
+         (canvas (il::resize-bicubic img dw dh (f32vec (* dw dh 3)) dw 0 0))
+         (px (f32vec (* width height 4))))
+    (dotimes (y height px)
+      (dotimes (x width)
+        (let ((o (* 3 (+ (* (+ y oy) dw) x ox))) (q (* 4 (+ (* y width) x))))
+          (dotimes (c 3) (setf (aref px (+ q c)) (- (/ (aref canvas (+ o c)) 127.5) 1)))
+          (setf (aref px (+ q 3)) 1f0))))))
 
 (defun rgba-octets (px &key (alpha t))
   "RGBA floats in -1 .. 1 as 8-bit samples: RGBA, or RGB over white without ALPHA."
