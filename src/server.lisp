@@ -73,6 +73,15 @@
     (loop while (> (* w h) +max-pixels+) do (decf w 16) (decf h 16))
     (values w h)))
 
+(defun edit-size (img)
+  "A picture's size for editing it: a megapixel of its shape, each side a
+   multiple of 32 (diffusers' calculate_dimensions)."
+  (let* ((sw (il::rgb-image-width img)) (sh (il::rgb-image-height img)) (ratio (/ sw sh))
+         (w (max 256 (* 32 (round (sqrt (* 1024 1024 ratio)) 32))))
+         (h (max 256 (* 32 (round (/ (sqrt (* 1024 1024 ratio)) ratio) 32)))))
+    (loop while (> (* w h) +max-pixels+) do (if (> w h) (decf w 32) (decf h 32)))
+    (values w h)))
+
 (defun request-source (req)
   "REQ's source picture, \"image\": a data: URL or bare base64 (PNG, JPEG or
    WebP), as illatio's RGB-IMAGE; or NIL."
@@ -85,8 +94,10 @@
 
 (defun image-request (req)
   "REQ's fields checked: (values prompt width height n seed format alpha
-   source strength), SOURCE a picture to make one from (RGBA floats at the
-   size) or NIL."
+   source strength edit), SOURCE a picture to make one from (RGBA floats at
+   the size) or NIL; EDIT, a picture to edit, (PX W H), or NIL.  A picture
+   with \"strength\", or with no vision tower to see it, is a SOURCE; else
+   one to edit."
   (let ((prompt (il::jget req "prompt")) (n (or (il::jget req "n") 1))
         (seed (il::jget req "seed")) (format (or (il::jget req "response_format") "b64_json"))
         (output (il::jget req "output_format")))
@@ -98,22 +109,30 @@
     (unless (member format '("b64_json" "url") :test #'equal)
       (bad "response_format must be \"b64_json\" or \"url\""))
     (unless (member output '(nil "png") :test #'equal) (bad "output_format: only \"png\""))
-    (let ((src (request-source req)) (strength (or (il::jget req "strength") 0.8)))
+    (let* ((src (request-source req)) (asked (il::jget req "strength")) (strength (or asked 0.8))
+           (edit (and src (null asked) *engine* (engine-vision *engine*))))
       (unless (and (realp strength) (< 0 strength) (<= strength 1)) (bad "strength must be a number in (0, 1]"))
-      (multiple-value-bind (w h) (if (and src (null (il::jget req "size"))) (source-size src) (parse-size (il::jget req "size")))
+      (multiple-value-bind (w h) (cond ((il::jget req "size") (parse-size (il::jget req "size")))
+                                       (edit (edit-size src))
+                                       (src (source-size src))
+                                       (t (parse-size nil)))
         (values prompt w h n (or seed (random (expt 2 32) (make-random-state t))) format
                 (equal (il::jget req "background") "transparent")
-                (and src (picture-floats src w h)) (float strength 1d0))))))
+                (and src (not edit) (picture-floats src w h)) (float strength 1d0)
+                (and edit (multiple-value-bind (ew eh) (edit-size src) (list (picture-floats src ew eh) ew eh))))))))
 
 (defun images-object (req)
-  (multiple-value-bind (prompt w h n seed format alpha source strength) (image-request req)
+  (multiple-value-bind (prompt w h n seed format alpha source strength edit) (image-request req)
     (let* ((pngs (let ((made '()))      ; the n pictures in one turn on the GPU
                    (funcall *on-gpu*
                             (lambda ()
                               (dotimes (k n)
                                 (multiple-value-bind (px pw ph)
-                                    (generate *engine* prompt :width w :height h :seed (+ seed k)
-                                                  :init source :strength strength)
+                                    (if edit
+                                        (destructuring-bind (epx ew eh) edit
+                                          (edit *engine* prompt epx ew eh :width w :height h :seed (+ seed k)))
+                                        (generate *engine* prompt :width w :height h :seed (+ seed k)
+                                                  :init source :strength strength))
                                   (push (list px pw ph) made)))))
                    (mapcar (lambda (m)
                              (destructuring-bind (px pw ph) m

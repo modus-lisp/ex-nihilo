@@ -47,6 +47,12 @@
     (format *error-output* "ex-nihilo: the decoder and encoder (~,2F GB as floats) on ~A~%" (/ bytes 1d9) (il::cudev-name dev))
     v))
 
+(defun vae-release (v)
+  "V's scratch freed: a decode at 1536 x 1024 leaves some 11 GB, which the
+   DiT wants back for its next picture."
+  (maphash (lambda (k e) (declare (ignore k)) (il::cuda-free (car e))) (gvae-buf v))
+  (clrhash (gvae-buf v)))
+
 ;;; The building blocks both directions use, as local functions of the body:
 ;;; WT, B (scratch by key), EW, CONV1, CONV3, CONV3S2, NORM-SILU, RESBLOCK,
 ;;; ATTENTION.  MAX-IN: the floats a residual block's scratch must hold.

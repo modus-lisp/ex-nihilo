@@ -40,11 +40,25 @@ background at all.
 
 <br clear="right">
 
-## From a picture
+## Editing
 
-Give it a picture as well as a prompt and it starts from that picture instead
-of from noise: the picture is encoded, noised part of the way, and the steps
-run from there. `strength` says how far it may go.
+Give it a picture and say what to change. The prompt encoder sees the picture
+through Qwen3-VL's vision tower, and the DiT gets it as a latent ahead of the
+one it is making, so what you don't mention stays put.
+
+| | | | |
+|:---:|:---:|:---:|:---:|
+| ![](docs/pictures/bakery.jpg) | ![](docs/pictures/fox.jpg) | ![](docs/pictures/coffee.jpg) | ![](docs/pictures/cabin.jpg) |
+| ![](docs/pictures/edit-bakery.jpg) | ![](docs/pictures/edit-fox.jpg) | ![](docs/pictures/edit-coffee.jpg) | ![](docs/pictures/edit-cabin.jpg) |
+| <sub>*Change the sign to read 'FRESH PIE' above 'OPEN DAILY'.*</sub> | <sub>*Put a small red knitted scarf around the fox's neck.*</sub> | <sub>*Replace the cup of coffee with a tall glass of orange juice.*</sub> | <sub>*Make it a sunny winter afternoon, the sky blue.*</sub> |
+
+<sub>The pictures above, edited; the prompt under each is all it was given (seed 1).</sub>
+
+## Repainting
+
+With `strength`, a picture is used another way: it is encoded, noised part of
+the way, and the steps run from there, the prompt describing the whole result.
+`strength` says how far it may go.
 
 | source | 0.6 | 0.8 | 0.9 |
 |:---:|:---:|:---:|:---:|
@@ -56,13 +70,14 @@ cutting through the falling snow, oil painting*: at 0.6 the lamp is lit, at
 
 It is best at light, weather, season and mood, with the composition kept; a
 photograph turned into another medium wants a high strength (0.9 and up).
-Precise edits ("remove the car") are an editing model's job, not this one's.
+For anything precise, edit instead.
 
 ## How it works
 
-    prompt ──► Qwen3-VL-8B's text model (Q8_0) ──► its last states, kept per prompt
+    prompt (and a picture to edit, through the vision tower)
+       ──► Qwen3-VL-8B's text model (Q8_0) ──► its last states, kept per prompt
                                                         │
-    noise (or a picture, encoded and noised) ──► DiT: 7B, 32 blocks, 8 Euler steps
+    noise (beside the picture to edit, as a latent) ──► DiT: 7B, 32 blocks, 8 Euler steps
                                                         │
                                               VAE decoder (Wan 2.2's) ──► RGBA PNG
 
@@ -76,18 +91,23 @@ and `inspect/` holds the numpy references the kernels were checked against.
 
 On an RTX 3090, the encoder on a second card: 1024x1024 in about 11 s (9.5 s
 of steps, 1.5 s of decoding), 1536x1024 in about 22 s. A picture from a
-picture takes half a second more to encode, and fewer steps.
+picture takes half a second more to encode, and fewer steps. An edit at a
+megapixel takes about 20 s, the picture's tokens doubling the DiT's sequence.
 
 ## Running it
 
 SBCL on Linux and an NVIDIA GPU: the DiT and decoder on a 24 GB card, the
 prompt encoder on a second (or on the CPU, slower), illatio checked out
-beside this directory. The weights, about 17 GB:
+beside this directory. The weights, about 18 GB:
 
     mkdir -p /mnt/ollama/exn && cd /mnt/ollama/exn
     curl -L -o vae.safetensors https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/vae/qwen_image_2.1_vae_bf16.safetensors
     curl -L -o dit-q8_0.gguf   https://huggingface.co/unsloth/Qwen-Image-2.1-Turbo-GGUF/resolve/main/qwen-image-2.1-turbo-Q8_0.gguf
     curl -L -o te-q8_0.gguf    https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF/resolve/main/Qwen3VL-8B-Instruct-Q8_0.gguf
+    curl -L -o mmproj-f16.gguf https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF/resolve/main/mmproj-Qwen3VL-8B-Instruct-F16.gguf
+
+The last is the vision tower, for editing; without it (or with the encoder on
+the CPU) pictures are only repainted.
 
 `bin/ex-nihilo` serves OpenAI's image API on loopback (no authentication):
 
@@ -106,11 +126,12 @@ beside this directory. The weights, about 17 GB:
 - `seed`: the same prompt and seed give the same picture
 - `background`: `transparent` for RGBA
 - `response_format`: `b64_json`, or `url` for a `data:` URL
-- `image`: a picture to start from, a `data:` URL or bare base64 of a PNG,
-  JPEG or WebP; without `size` the result takes its shape (up to a megapixel)
-- `strength`: with `image`, 0-1 (default 0.8), the share of the eight steps
-  that run -- about 0.5 keeps it close, 0.8 relights and restyles it with its
-  composition kept, 0.9 keeps only its layout, 1 ignores it
+- `image`: a picture to edit, a `data:` URL or bare base64 of a PNG, JPEG or
+  WebP, the prompt saying what to change; without `size` the result takes its
+  shape (a megapixel)
+- `strength`: with `image`, 0-1, to repaint it instead of editing it: the
+  share of the eight steps that run -- about 0.5 keeps it close, 0.8 relights
+  and restyles it with its composition kept, 0.9 keeps only its layout
 
 It answers `{"created", "data": [{"b64_json", "seed"}]}`. `GET /v1/models`
 and `GET /health` are as illatio's. Requests take turns on the GPU.
@@ -137,6 +158,6 @@ the same architecture with its refusal direction projected out.
 ## Not yet
 
 Apple Silicon (the design is sized for a 48 GB MacBook Pro; the kernels are
-CUDA so far), editing models, LoRAs.
+CUDA so far), LoRAs, more than one picture to edit at once.
 
 MIT licensed.

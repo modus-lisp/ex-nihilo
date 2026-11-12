@@ -13,4 +13,4 @@
            #:open-dit #:open-vae #:check-weights
            #:load-encoder #:encode-prompt
            #:upload-dit #:dit-velocity #:upload-vae #:vae-decode
-           #:load-engine #:generate #:write-picture #:serve #:main))
+           #:load-engine #:generate #:edit #:write-picture #:serve #:main))

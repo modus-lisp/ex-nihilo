@@ -24,6 +24,7 @@
                    (load-engine :dit (namestring (merge-pathnames "dit-q8_0.gguf" dir))
                                 :vae (namestring (merge-pathnames "vae.safetensors" dir))
                                 :encoder (or encoder (namestring (merge-pathnames "te-q8_0.gguf" dir)))
+                                :vision (namestring (merge-pathnames "mmproj-f16.gguf" dir))
                                 :device device :encoder-device encoder-device)))
          (bytes (il::cuda-park parking)))
     (format *error-output* "ex-nihilo: loaded and moved to host memory (~,1F GB), ~,1Fs~%"

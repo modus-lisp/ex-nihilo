@@ -19,6 +19,7 @@
      (:file "encoder")       ; the prompt: Qwen3-VL's text model, its last block's states
      (:file "cuda-dit" :if-feature (:and :sbcl :linux))   ; the DiT on an NVIDIA GPU (kernels: src/cuda/)
      (:file "cuda-vae" :if-feature (:and :sbcl :linux))   ; the decoder there
+     (:file "cuda-vision" :if-feature (:and :sbcl :linux)) ; Qwen3-VL's vision tower, for editing
      (:file "generate")))))  ; noise, eight steps, the decoder: a PNG
 
 (defsystem "ex-nihilo/server"

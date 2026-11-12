@@ -8,7 +8,7 @@
 //   x_gate_add(count, width, n0, p, mstride, x, h, gate)
 //                                                   X += tanh(GATE[row]) * H
 //   x_qk_norm_rope(n, w, cs, x)                     X's 32 heads of 128: RMSNorm * W, then RoPE
-//   x_attend(q, k, v, out, nh, hd, n, q0, p, l, scale)
+//   x_attend(q, k, v, out, nh, hd, n, q0, p, l, b0, b1, scale)
 //                                                   prompt queries causal, image queries all L keys
 //   x_swiglu2(count, f, gu, out)                    OUT = silu(GU[:, :F]) * GU[:, F:]
 //   x_gelu_tanh(count, x)                           X = gelu(X), the tanh form
@@ -57,15 +57,22 @@ extern "C" __global__ void x_qk_norm_rope(int n, const float* __restrict__ w, co
   r[2 * j + 1] = an * s + bn * c;
 }
 
-// illatio's attn_prefill2 (dense.cu), its mask the DiT's: query t is row
-// Q0 + t of the sequence; a row below P (the prompt) sees keys 0 .. itself,
-// any other row all L keys.  K, V: L rows of NH x HD.  76 KB of shared
+// The DiT's mask: row G of the sequence sees keys 0 .. XA_LIM(G).  The prefix
+// (rows below P) is causal but for a reference picture's block, rows B0 .. B1 - 1,
+// which sees itself whole; the rest (the picture being made) sees all L keys.
+// Never decreasing in G, so a tile's last key is its last row's.
+__device__ __forceinline__ int xa_lim(int g, int p, int l, int b0, int b1) {
+  return g >= p ? l - 1 : (g >= b0 && g < b1 ? b1 - 1 : g);
+}
+
+// illatio's attn_prefill2 (dense.cu), with XA_LIM's mask: query t is row
+// Q0 + t of the sequence.  K, V: L rows of NH x HD.  76 KB of shared
 // memory at HD 128.  grid (nh, ceil(n/64)), block 256.
 #define XA_Q 64
 #define XA_K 32
 extern "C" __global__ void __launch_bounds__(256)
 x_attend(const float* __restrict__ q, const float* __restrict__ kc, const float* __restrict__ vc,
-         float* __restrict__ out, int nh, int hd, int n, int q0, int p, int l, float scale) {
+         float* __restrict__ out, int nh, int hd, int n, int q0, int p, int l, int b0, int b1, float scale) {
   extern __shared__ __align__(16) float fsm[];
   int hp = hd + 4;
   float* sq = fsm;                            // [64][hd+4]
@@ -88,7 +95,7 @@ x_attend(const float* __restrict__ q, const float* __restrict__ kc, const float*
 #pragma unroll
     for (int e = 0; e < 16; e++) o[i][e] = 0.0f; }
   const int tmax = q0 + min(n, t0 + XA_Q) - 1;
-  const int last = tmax >= p ? l - 1 : tmax;
+  const int last = xa_lim(tmax, p, l, b0, b1);
   for (int p0 = 0; p0 <= last; p0 += XA_K) {
     __syncthreads();
     {
@@ -124,7 +131,7 @@ x_attend(const float* __restrict__ q, const float* __restrict__ kc, const float*
 #pragma unroll
     for (int i = 0; i < 4; i++) {
       int g = q0 + t0 + 4 * ty + i;
-      int lim = g < p ? g : l - 1;
+      int lim = xa_lim(g, p, l, b0, b1);
       bool live = t0 + 4 * ty + i < n;
       float a = (live && p0 + tx <= lim) ? s[i][0] : -INFINITY;
       float b = (live && p0 + tx + 16 <= lim) ? s[i][1] : -INFINITY;
@@ -223,7 +230,7 @@ __device__ __forceinline__ void xm_mma(float* c, const unsigned* a, unsigned b0,
 
 extern "C" __global__ void __launch_bounds__(256)
 x_attend_mma(const float* __restrict__ q, const float* __restrict__ kc, const float* __restrict__ vc,
-             float* __restrict__ out, int n, int q0, int p, int l, float scale) {
+             float* __restrict__ out, int n, int q0, int p, int l, int b0, int b1, float scale) {
   __shared__ __align__(16) u16 sk[XM_K * XM_KS];
   __shared__ __align__(16) u16 sv[128 * XM_VS];
   const int head = blockIdx.x, t0 = blockIdx.y * XM_Q;
@@ -250,9 +257,9 @@ x_attend_mma(const float* __restrict__ q, const float* __restrict__ kc, const fl
 #pragma unroll
   for (int j = 0; j < 16; ++j) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.f;
   float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;
-  const int lim0 = q0 + r0 < p ? q0 + r0 : l - 1, lim1 = q0 + r1 < p ? q0 + r1 : l - 1;
+  const int lim0 = xa_lim(q0 + r0, p, l, b0, b1), lim1 = xa_lim(q0 + r1, p, l, b0, b1);
   const int tmax = q0 + min(n, t0 + XM_Q) - 1;
-  const int last = tmax >= p ? l - 1 : tmax;
+  const int last = xa_lim(tmax, p, l, b0, b1);
   for (int k0 = 0; k0 <= last; k0 += XM_K) {
     __syncthreads();
     for (int e = tid; e < XM_K * 32; e += 256) {

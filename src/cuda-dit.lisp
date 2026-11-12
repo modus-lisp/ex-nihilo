@@ -96,6 +96,17 @@
                (car (setf (gethash key (gdit-buf d))
                           (cons (il::cuda-alloc (gdit-dev d) (* 4 floats) :zero nil) floats)))))))
 
+(defun dit-release (d)
+  "D's scratch and kept prompt keys and values freed: a picture's steps
+   done, the decoder wants the room (an edit's sequence is twice a
+   picture's, and the scratch it leaves would be parked and brought back
+   with the weights every time)."
+  (maphash (lambda (k e) (declare (ignore k)) (il::cuda-free (car e))) (gdit-buf d))
+  (clrhash (gdit-buf d))
+  (when (gdit-prefix d)
+    (loop for e across (gdit-prefix d) when e do (il::cuda-free (car e)) (il::cuda-free (cdr e))))
+  (setf (gdit-prefix d) nil (gdit-prefix-key d) nil (gdit-prefix-length d) 0))
+
 (defvar *int8* t
   "Whether many rows through a Q8_0 matrix go as int8 activations (illatio's
    MM_Q8_MMA2: X quantized to Q8_0 by blocks of 32, the int8 tensor cores --
@@ -144,20 +155,39 @@
                                    (incf j))))))
     v))
 
-(defun dit-positions (p h w)
-  "The prompt's P tokens at (i, i, i); the H x W image after them at (P, row, col), centred."
-  (append (loop for i below p collect (list i i i))
-          (loop for r below h
-                append (loop for c below w collect (list p (- r (- h (floor h 2))) (- c (- w (floor w 2))))))))
+(defun image-positions (frame h w)
+  "An H x W block's positions: FRAME, and its rows and columns centred on zero."
+  (loop for r below h
+        append (loop for c below w collect (list frame (- r (- h (floor h 2))) (- c (- w (floor w 2)))))))
+
+(defun dit-positions (p h w &optional ref)
+  "Every row's (frame row col): the prompt's text at (i, i, i), the H x W image
+   after it at the position reached, centred.  With REF, (A RH RW): the prompt
+   is A text rows, a RH x RW reference picture, then the rest of its P rows'
+   text; the picture's frame is A, and the text after it goes on from A +
+   max(RH, RW) (diffusers' QwenImage21Rope)."
+  (if (null ref)
+      (append (loop for i below p collect (list i i i)) (image-positions p h w))
+      (destructuring-bind (a rh rw) ref
+        (let* ((after (- p a (* rh rw))) (pos (+ a (max rh rw))))
+          (append (loop for i below a collect (list i i i))
+                  (image-positions a rh rw)
+                  (loop for i below after collect (let ((x (+ pos i))) (list x x x)))
+                  (image-positions (+ pos after) h w))))))
 
 ;;; --- a step -------------------------------------------------------------------------
 
-(defun dit-velocity (d context p latent h w sigma &key (prefix-key nil))
+(defun dit-velocity (d context p latent h w sigma &key (prefix-key nil) ref)
   "The DiT's velocity at noise level SIGMA: LATENT (64 x H x W floats,
    channel-major) in, the same shape out.  CONTEXT: the encoder's P x 4096
    states.  With PREFIX-KEY, the prompt's keys and values are kept under it
-   after the first call and reused by the next ones with the same key."
+   after the first call and reused by the next ones with the same key.
+   REF, a picture to edit: (A LATENT RH RW), its normalized latent (64 x RH x
+   RW) put in the prefix after the encoder's first A states, in place of its
+   image slots (those states left out of CONTEXT); P counts the text only."
   (let* ((dev (gdit-dev d)) (nimg (* h w))
+         (ptext p) (nref (if ref (* (third ref) (fourth ref)) 0)) (a (if ref (first ref) 0))
+         (p (+ p nref))                    ; the prefix: text and the reference picture
          (cached (and prefix-key (equal prefix-key (gdit-prefix-key d)) (= p (gdit-prefix-length d))))
          (n0 (if cached p 0))              ; the first row this pass computes
          (n (if cached nimg (+ p nimg)))   ; rows it computes
@@ -184,17 +214,25 @@
                 (gu (b :gu (* l 2 ffn))) (ff (b :ff (* l ffn))) (cs (b :cs (* l 128)))
                 (img (b :img (* nimg 64))))
             (unless cached
-              (let ((c (b :ctx (* p wd))) (t1 (b :t1 (* p wd))))
+              (let ((c (b :ctx (* ptext wd))) (t1 (b :t1 (* ptext wd))))
                 (il::cuda-upload-vector c context)
-                (il::launch dev "v_rms" p 256 (list wd 1f-6 c (vec "txt_in.text_norm.weight") t1))
-                (mm d "txt_in.in_layer.weight" t1 hh p)
-                (elementwise d "x_gelu_tanh" (* p wd) hh)
-                (mm d "txt_in.out_layer.weight" hh x p)))
+                (il::launch dev "v_rms" ptext 256 (list wd 1f-6 c (vec "txt_in.text_norm.weight") t1))
+                (mm d "txt_in.in_layer.weight" t1 hh ptext)
+                (elementwise d "x_gelu_tanh" (* ptext wd) hh)
+                (cond ((null ref) (mm d "txt_in.out_layer.weight" hh x ptext))
+                      (t ;; text before the picture, the picture through img_in, the text after
+                       (mm d "txt_in.out_layer.weight" hh c ptext)
+                       (il::cuda-copy-dd x 0 c 0 (* 4 a wd))
+                       (il::cuda-copy-dd x (* 4 (+ a nref) wd) c (* 4 a wd) (* 4 (- ptext a) wd))
+                       (let ((rows (f32vec (* nref 64))) (rl (second ref)) (ri (b :ri (* nref 64))))
+                         (dotimes (ch 64) (dotimes (i nref) (setf (aref rows (+ (* i 64) ch)) (aref rl (+ (* ch nref) i)))))
+                         (il::cuda-upload-vector ri rows)
+                         (mm d "img_in.weight" ri (cons x (* 4 a wd)) nref))))))
             (let ((tokens (f32vec (* nimg 64))))  ; channel-major to a row of 64 a pixel
               (dotimes (c 64) (dotimes (i nimg) (setf (aref tokens (+ (* i 64) c)) (aref latent (+ (* c nimg) i)))))
               (il::cuda-upload-vector img tokens))
             (mm d "img_in.weight" img (cons x (* 4 (- p n0) wd)) nimg)
-            (il::cuda-upload-vector cs (rope-table (nthcdr n0 (dit-positions p h w))))
+            (il::cuda-upload-vector cs (rope-table (nthcdr n0 (dit-positions p h w (and ref (list a (third ref) (fourth ref)))))))
             (unless cached
               (setf (gdit-prefix d) (or (gdit-prefix d) (make-array 32 :initial-element nil))
                     (gdit-prefix-key d) nil))
@@ -223,9 +261,9 @@
                          (il::cuda-copy-dd (cdr pre) 0 vb 0 (* 4 p wd)))))
                 (if (>= (il::cudev-arch dev) 80)
                     (il::launch dev "x_attend_mma" (list 32 (ceiling n 128)) 256
-                                (list q kb vb att n n0 p l (coerce (/ (sqrt 128d0)) 'single-float)))
+                                (list q kb vb att n n0 p l a (+ a nref) (coerce (/ (sqrt 128d0)) 'single-float)))
                     (il::launch dev "x_attend" (list 32 (ceiling n 64)) 256
-                                (list q kb vb att 32 128 n n0 p l (coerce (/ (sqrt 128d0)) 'single-float))
+                                (list q kb vb att 32 128 n n0 p l a (+ a nref) (coerce (/ (sqrt 128d0)) 'single-float))
                                 :shared (* 4 (+ (* 64 132) (* 32 132) (* 32 128) (* 32 68)))))
                 (mm d (blk "attn.to_out.0.weight") att hh n)
                 (elementwise d "x_gate_add" (* n wd) wd n0 p (* 4 wd) x hh (piece 1))

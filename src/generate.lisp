@@ -24,14 +24,19 @@
 
 (defstruct (engine (:constructor %make-engine))
   encoder dit vae
+  vision                                      ; Qwen3-VL's vision tower, for editing; or NIL
   (prompts (make-hash-table :test 'equal)))   ; prompt -> (states . p), the last few
 
 (defun load-engine (&key (dit "/mnt/ollama/exn/dit-q8_0.gguf") (vae "/mnt/ollama/exn/vae.safetensors")
-                         (encoder "/mnt/ollama/exn/te-q8_0.gguf") (device 0) (encoder-device 1))
-  "The three models: the DiT and decoder on CUDA device DEVICE, the encoder
-   on ENCODER-DEVICE (NIL: the CPU)."
+                         (encoder "/mnt/ollama/exn/te-q8_0.gguf") (vision "/mnt/ollama/exn/mmproj-f16.gguf")
+                         (device 0) (encoder-device 1))
+  "The models: the DiT and decoder on CUDA device DEVICE, the encoder on
+   ENCODER-DEVICE (NIL: the CPU), and beside it, when the encoder is on a
+   GPU and the file VISION is there, the vision tower that editing wants."
   (%make-engine :encoder (load-encoder encoder :device encoder-device) :dit (upload-dit dit :device device)
-                :vae (upload-vae vae :device device)))
+                :vae (upload-vae vae :device device)
+                :vision (and encoder-device vision (probe-file vision)
+                             #+(and sbcl linux) (load-vision vision :device encoder-device))))
 
 (defun gaussian-noise (n seed)
   "N standard normal floats from SEED (Box-Muller over SBCL's generator)."
@@ -59,6 +64,50 @@
          (k (max 0 (min (1- steps) (round (* (- 1 strength) steps))))))
     (nthcdr k sigmas)))
 
+(defun normalized-latent (e px width height)
+  "PX (RGBA floats, WIDTH x HEIGHT) encoded, each channel normalized."
+  (let* ((x (prog1 (vae-encode (engine-vae e) px height width)
+              #+(and sbcl linux) (vae-release (engine-vae e))))
+         (n (floor (length x) 64)))
+    (dotimes (c 64 x)
+      (let ((m (float (aref +latent-mean+ c) 1f0)) (sd (float (aref +latent-std+ c) 1f0)))
+        (dotimes (i n)
+          (let ((k (+ (* c n) i))) (setf (aref x k) (/ (- (aref x k) m) sd))))))))
+
+(defvar *edits* 0 "A count, to tell one edit's prompt keys from another's.")
+
+(defun edit (e prompt picture pw ph &key (width pw) (height ph) (seed 0) (sigmas +turbo-sigmas+) (verbose t))
+  "PICTURE (RGBA floats in -1 .. 1, PW x PH, multiples of 32) edited as
+   PROMPT says, Qwen-Image-2.1's way: the picture seen by the prompt encoder
+   (its vision tower) and put in the DiT's prefix as a latent, the new one
+   made from noise beside it.  (values rgba width height), as GENERATE."
+  (assert (and (zerop (mod pw 32)) (zerop (mod ph 32)) (zerop (mod width 16)) (zerop (mod height 16))))
+  (unless (engine-vision e) (error "editing wants the vision tower (mmproj-f16.gguf) and the encoder on a GPU"))
+  (let* ((t0 (get-internal-real-time)) (h (floor height 16)) (w (floor width 16)) (n (* h w))
+         (z (gaussian-noise (* 64 n) seed)) (key (list :edit (incf *edits*))))
+    (flet ((elapsed () (/ (- (get-internal-real-time) t0) internal-time-units-per-second)))
+      (multiple-value-bind (states p a)
+          (encode-prompt (engine-encoder e) prompt :vision (engine-vision e) :picture (list picture ph pw))
+        (when verbose (format *error-output* "ex-nihilo: prompt and picture, ~D tokens, ~,1Fs~%" p (elapsed)))
+        (let ((ref (list a (normalized-latent e picture pw ph) (floor ph 16) (floor pw 16))))
+          (when verbose (format *error-output* "ex-nihilo: the picture encoded, ~,1Fs~%" (elapsed)))
+          (loop for (s s2) on sigmas while s2
+                do (let ((v (dit-velocity (engine-dit e) states p z h w s :prefix-key key :ref ref)))
+                     (dotimes (i (length z)) (incf (aref z i) (* (coerce (- s2 s) 'single-float) (aref v i))))))))
+      (when verbose (format *error-output* "ex-nihilo: ~D steps, ~,1Fs~%" (1- (length sigmas)) (elapsed)))
+      (decode-latent e z h w verbose #'elapsed))))
+
+(defun decode-latent (e z h w verbose elapsed)
+  #+(and sbcl linux) (dit-release (engine-dit e))
+  (let ((n (* h w)))
+    (dotimes (c 64)
+      (let ((m (float (aref +latent-mean+ c) 1f0)) (sd (float (aref +latent-std+ c) 1f0)))
+        (dotimes (i n) (setf (aref z (+ (* c n) i)) (+ m (* sd (aref z (+ (* c n) i))))))))
+    (multiple-value-bind (px ph pw) (vae-decode (engine-vae e) z h w)
+      #+(and sbcl linux) (vae-release (engine-vae e))
+      (when verbose (format *error-output* "ex-nihilo: decoded, ~,1Fs~%" (funcall elapsed)))
+      (values px pw ph))))
+
 (defun generate (e prompt &key (width 1024) (height 1024) (seed 0) (sigmas +turbo-sigmas+) (verbose t)
                                init (strength 0.8))
   "The picture PROMPT asks for: (values rgba width height), RGBA floats in
@@ -73,12 +122,9 @@
       (when init
         (assert (= (length init) (* 4 width height)))
         (setf sigmas (start-sigmas sigmas strength))
-        (let ((x (vae-encode (engine-vae e) init height width)) (s (float (first sigmas) 1f0)))
-          (dotimes (c 64)
-            (let ((m (float (aref +latent-mean+ c) 1f0)) (sd (float (aref +latent-std+ c) 1f0)))
-              (dotimes (i n)
-                (let ((k (+ (* c n) i)))
-                  (setf (aref z k) (+ (* (- 1 s) (/ (- (aref x k) m) sd)) (* s (aref z k)))))))))
+        (let ((x (normalized-latent e init width height)) (s (float (first sigmas) 1f0)))
+          (dotimes (k (length z))
+            (setf (aref z k) (+ (* (- 1 s) (aref x k)) (* s (aref z k))))))
         (when verbose (format *error-output* "ex-nihilo: the source encoded, from sigma ~,3F, ~,1Fs~%"
                               (first sigmas) (elapsed))))
       (destructuring-bind (states . p) (prompt-states e prompt)
@@ -87,12 +133,7 @@
               do (let ((v (dit-velocity (engine-dit e) states p z h w s :prefix-key prompt)))
                    (dotimes (i (length z)) (incf (aref z i) (* (coerce (- s2 s) 'single-float) (aref v i))))))
         (when verbose (format *error-output* "ex-nihilo: ~D steps, ~,1Fs~%" (1- (length sigmas)) (elapsed)))
-        (dotimes (c 64)
-          (let ((m (float (aref +latent-mean+ c) 1f0)) (sd (float (aref +latent-std+ c) 1f0)))
-            (dotimes (i n) (setf (aref z (+ (* c n) i)) (+ m (* sd (aref z (+ (* c n) i))))))))
-        (multiple-value-bind (px ph pw) (vae-decode (engine-vae e) z h w)
-          (when verbose (format *error-output* "ex-nihilo: decoded, ~,1Fs~%" (elapsed)))
-          (values px pw ph))))))
+        (decode-latent e z h w verbose #'elapsed)))))
 
 (defun picture-floats (img width height)
   "IMG (illatio's RGB-IMAGE) as WIDTH x HEIGHT RGBA floats in -1 .. 1, opaque:
