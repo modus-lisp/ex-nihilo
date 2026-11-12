@@ -10,6 +10,7 @@
 ;;;; model gives up what it holds as a cache (DeepSeek's expert pools,
 ;;;; LEND-DEVICES), these come back from host memory, the pictures are made,
 ;;;; they go back to host memory, the chat model's caches are made again.
+;;;; EXN_PROFILE in the environment: each request's GPU time by kernel, logged.
 
 (in-package #:ex-nihilo)
 
@@ -39,11 +40,26 @@
                     (lambda ()
                       (let ((p (tenant-parking tenant)) (t0 (get-internal-real-time)))
                         (il::unpark-memory p)
-                        (format *error-output* "ex-nihilo: unparked, ~,1Fs~%"
-                                (/ (- (get-internal-real-time) t0) internal-time-units-per-second))
+                        (format *error-output* "ex-nihilo: unparked, ~,1Fs~@[ (Metal holds ~,1F GB of ~,1F)~]~%"
+                                (/ (- (get-internal-real-time) t0) internal-time-units-per-second)
+                                #+(and sbcl darwin) (let ((dev (il::gpu-device (exn-gpu))))
+                                                      (/ (il::msg sb-alien:unsigned-long dev "currentAllocatedSize") 1d9))
+                                #-(and sbcl darwin) nil
+                                #+(and sbcl darwin) (let ((dev (il::gpu-device (exn-gpu))))
+                                                      (/ (il::msg sb-alien:unsigned-long dev "recommendedMaxWorkingSetSize") 1d9))
+                                #-(and sbcl darwin) nil)
                         (unwind-protect
                              (il::with-parking-record (p)     ; scratch and caches made now are parked too
-                               (funcall fn))
+                               (if (uiop:getenv "EXN_PROFILE")
+                                   (let ((il::*gpu-profile* (make-hash-table :test 'equal)) (t1 (get-internal-real-time)))
+                                     (multiple-value-prog1 (funcall fn)
+                                       (let ((rows (sort (loop for k being the hash-keys of il::*gpu-profile* using (hash-value v)
+                                                               collect (cons k v)) #'> :key #'cdr)))
+                                         (format *error-output* "ex-nihilo: ~,1Fs wall, ~,1Fs on the GPU:~{ ~A ~,2F~}~%"
+                                                 (/ (- (get-internal-real-time) t1) internal-time-units-per-second)
+                                                 (reduce #'+ rows :key #'cdr)
+                                                 (loop for (k . v) in (subseq rows 0 (min 6 (length rows))) collect k collect v)))))
+                                   (funcall fn)))
                           (let ((t1 (get-internal-real-time)) (bytes (il::park-memory p)))
                             (format *error-output* "ex-nihilo: parked (~,1F GB:~{ ~,1F on ~A~^,~}), ~,1Fs~%"
                                     (/ bytes 1d9) (parked-by-device p)
