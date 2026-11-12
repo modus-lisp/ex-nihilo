@@ -3,8 +3,9 @@
 ;;;; bin/illatio-server --images DIR loads this system (illatio does not
 ;;;; depend on ex-nihilo; it finds it beside itself) and calls MAKE-TENANT
 ;;;; before its chat model is loaded: the three models go to their devices,
-;;;; then all of their device memory to pinned host memory (illatio's
-;;;; CUDA-PARK).  ATTACH-TENANT adds the image routes to illatio's.  A
+;;;; then all of their device memory given up (illatio's PARK-MEMORY: on CUDA
+;;;; to pinned host memory, on Metal released from its working set, a wrapped
+;;;; file just unwrapped).  ATTACH-TENANT adds the image routes to illatio's.  A
 ;;;; request's pictures then borrow the GPUs between chat requests: the chat
 ;;;; model gives up what it holds as a cache (DeepSeek's expert pools,
 ;;;; LEND-DEVICES), these come back from host memory, the pictures are made,
@@ -26,8 +27,8 @@
                                 :encoder (or encoder (namestring (merge-pathnames "te-q8_0.gguf" dir)))
                                 :vision (namestring (merge-pathnames "mmproj-f16.gguf" dir))
                                 :device device :encoder-device encoder-device)))
-         (bytes (il::cuda-park parking)))
-    (format *error-output* "ex-nihilo: loaded and moved to host memory (~,1F GB), ~,1Fs~%"
+         (bytes (il::park-memory parking)))
+    (format *error-output* "ex-nihilo: loaded and parked (~,1F GB given up), ~,1Fs~%"
             (/ bytes 1d9) (/ (- (get-internal-real-time) t0) internal-time-units-per-second))
     (%make-tenant :engine engine :parking parking)))
 
@@ -37,19 +38,21 @@
   (il::lend-devices (tenant-chat tenant)
                     (lambda ()
                       (let ((p (tenant-parking tenant)) (t0 (get-internal-real-time)))
-                        (il::cuda-unpark p)
-                        (format *error-output* "ex-nihilo: on the GPUs, ~,1Fs~%"
+                        (il::unpark-memory p)
+                        (format *error-output* "ex-nihilo: unparked, ~,1Fs~%"
                                 (/ (- (get-internal-real-time) t0) internal-time-units-per-second))
                         (unwind-protect
                              (il::with-parking-record (p)     ; scratch and caches made now are parked too
                                (funcall fn))
-                          (let ((t1 (get-internal-real-time)) (bytes (il::cuda-park p)))
-                            (format *error-output* "ex-nihilo: back in host memory (~,1F GB:~{ ~,1F on ~A~^,~}), ~,1Fs~%"
+                          (let ((t1 (get-internal-real-time)) (bytes (il::park-memory p)))
+                            (format *error-output* "ex-nihilo: parked (~,1F GB:~{ ~,1F on ~A~^,~}), ~,1Fs~%"
                                     (/ bytes 1d9) (parked-by-device p)
                                     (/ (- (get-internal-real-time) t1) internal-time-units-per-second))))))))
 
 (defun parked-by-device (p)
-  "(GB device-name ...) for P's parked buffers."
+  "(GB device-name ...) for P's parked buffers (on Metal, one GPU)."
+  #+(and sbcl darwin) (list (/ (reduce #'+ (il::parking-parked p) :key #'il::gbuf-bytes) 1d9) "the GPU")
+  #-(and sbcl darwin)
   (let ((by (make-hash-table)))
     (dolist (b (il::parking-parked p))
       (incf (gethash (il::cudev-index (il::dbuf-dev b)) by 0) (il::dbuf-bytes b)))

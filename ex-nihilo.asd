@@ -31,4 +31,4 @@
   :depends-on ("ex-nihilo" "illatio/server")
   :components ((:module "src" :serial t
                 :components ((:file "server")
-                             (:file "tenant" :if-feature (:and :sbcl :linux))))))   ; in illatio's server, sharing its GPUs
+                             (:file "tenant" :if-feature (:and :sbcl (:or :linux :darwin)))))))   ; in illatio's server, sharing its GPUs

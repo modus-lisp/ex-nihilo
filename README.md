@@ -169,7 +169,10 @@ In illatio's server instead, sharing the GPUs with a chat model:
 
 illatio loads this system for the flag (`src/tenant.lisp`). The two take
 turns: these models wait in pinned host memory and come back for a picture,
-the chat model moved out meanwhile -- a few seconds each way. That is how
+the chat model moved out meanwhile -- a few seconds each way. On a Mac
+(`--images ~/models/exn`) the same, with Metal's working set in place of
+the GPU's memory: the models released from it while they wait, the chat
+model's buffers (DeepSeek V4 Flash's expert pool included) while they work. That is how
 [operandi](https://github.com/modus-lisp/operandi) runs a local chat model
 and draws its pictures from one server.
 
