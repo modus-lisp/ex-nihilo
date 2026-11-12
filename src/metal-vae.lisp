@@ -1,11 +1,17 @@
 ;;;; metal-vae.lisp — the decoder (a latent to a picture) and the encoder (a
 ;;;; picture to a latent) on Apple silicon: cuda-vae.lisp's operations on
-;;;; Metal, in floats.  Channels last: a picture is H x W rows of C floats.
-;;;; Kernels: src/metal/exn.metal (x_conv takes the 3 x 3 convolutions, the
-;;;; 1 x 1s and the attention's products).  Each operation is a command
+;;;; Metal.  Channels last: a picture is H x W rows of C floats.  Kernels:
+;;;; src/metal/exn.metal (x_conv_h takes the 3 x 3 convolutions, the 1 x 1s
+;;;; and the attention's products as half products summed in floats; x_conv
+;;;; in floats, with *VAE-HALF* off).  Each operation is a command
 ;;;; buffer of its own, and waited for.
 
 (in-package #:ex-nihilo)
+
+(defvar *vae-half* t
+  "Whether the convolutions run as halves on the matrix units (x_conv_h:
+   inputs and weights rounded to halves, sums in floats) or in floats
+   (x_conv).")
 
 (defstruct (mvae (:constructor %make-mvae))
   gpu
@@ -53,11 +59,18 @@
                 (il::with-gpu-work (e gpu)
                   (il::dispatch gpu e kernel args buffers (ceiling count 256) 256)))
               (conv (wts bias x y cin cout hh ww taps stride &key (ldx cin) (ldy cout))
-                (let ((pixels (if (= stride 2) (* (floor hh 2) (floor ww 2)) (* hh ww))))
+                (let ((pixels (if (= stride 2) (* (floor hh 2) (floor ww 2)) (* hh ww)))
+                      (args (list cin cout hh ww taps stride ldx ldy (if bias 1 0))))
                   (il::with-gpu-work (e gpu)
-                    (il::dispatch gpu e "x_conv" (list cin cout hh ww taps stride ldx ldy (if bias 1 0))
-                                  (list wts (or bias wts) x y)
-                                  (list (ceiling pixels 64) (ceiling cout 64)) 256))))
+                    ;; halves on the matrix units when K stays within a tap (CIN a multiple of 16)
+                    (cond ((and *vae-half* (zerop (mod cin 32)) (zerop (mod ldx 4)))
+                           (il::dispatch gpu e "x_conv_h32" args (list wts (or bias wts) x y)
+                                         (list (ceiling pixels 64) (ceiling cout 64)) 128 :shared 16384))
+                          ((and *vae-half* (zerop (mod cin 16)) (zerop (mod ldx 4)))
+                           (il::dispatch gpu e "x_conv_h16" args (list wts (or bias wts) x y)
+                                         (list (ceiling pixels 64) (ceiling cout 64)) 128 :shared 16384))
+                          (t (il::dispatch gpu e "x_conv" args (list wts (or bias wts) x y)
+                                           (list (ceiling pixels 64) (ceiling cout 64)) 256))))))
               (conv1 (name x y cin cout n &optional res)
                 (conv (wt (format nil "~A.weight" name)) (wt (format nil "~A.bias" name)) x y cin cout 1 n 1 1)
                 (when res (ew "x_add" (* n cout) '() (list y res))))

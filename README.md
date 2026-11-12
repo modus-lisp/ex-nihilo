@@ -115,14 +115,19 @@ Metal and the prompt encoder on the CPU:
 
 | | 512x512 | 1024x1024 |
 |---|---|---|
-| eight steps | 20 s | 91 s |
-| decoding | 2 s | 10 s |
-| the whole picture, prompt to pixels | 22 s | 101 s |
+| eight steps | 19.6 s | 83.6 s |
+| decoding | 1 s | 4 s |
+| the whole picture, prompt to pixels | 20.7 s | 87.7 s |
+
+(From a cool start.  The steps' products run near the GPU's limit, and a
+long run is held by its power: eight steps in a row take about 10% longer
+than eight with the GPU rested between them.)
 
 The DiT's Q8_0 matrices are read where they lie in the mapped file (illatio's
 `d4_mm_q8_0`, half products summed in floats), its attention is a flash
 attention on the half simdgroup matrices (`src/metal/exn.metal`), and the
-decoder runs in floats.  `inspect/metal-kernels-test.lisp` checks the kernels
+decoder's convolutions are half products summed in floats too (a picture
+within 3 of 255 of the decoder in floats, 78 dB).  `inspect/metal-kernels-test.lisp` checks the kernels
 against plain Lisp.
 
 `bin/ex-nihilo` serves OpenAI's image API on loopback (no authentication):

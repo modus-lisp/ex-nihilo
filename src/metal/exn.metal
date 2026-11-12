@@ -151,38 +151,37 @@ static inline uint x_lim(uint g, uint p, uint l, uint b0, uint b1) {
 
 struct x_attn_args { uint n; uint q0; uint p; uint l; uint b0; uint b1; float scale; };
 
-// Flash attention on the half simdgroup matrices.  A threadgroup takes 32
-// query rows of one head, a simdgroup 8 of them; the keys go 32 a step
-// through threadgroup memory (K and V as halves), shared by the four.  S =
-// Q K^T and O += P V are half products summed in floats, P rounded to
-// halves, the softmax kept running per row (max M, sum L): four lanes a
-// row, eight keys each.  O's rescaling by a row's factor is a product with
-// that diagonal.  Q, K, V: rows of 4096 halves (32 heads of 128); OUT rows
-// of 4096 floats.  grid (32, ceil(n/32)), threads 128, 32768 bytes shared.
+// Flash attention on the half simdgroup matrices.  A threadgroup takes 64
+// query rows of one head, each of its eight simdgroups 8 of them; the keys
+// go 32 a step through threadgroup memory (K and V as halves), shared by
+// the eight (so K and V are read from memory once for 64 queries).  S = Q
+// K^T and O += P V are half products summed in floats, P rounded to halves,
+// the softmax kept running per row (max M, sum L): four lanes a row, eight
+// keys each.  O's rescaling by a row's factor is a product with that
+// diagonal, skipped when every factor is 1.  Q, K, V: rows of 4096 halves
+// (32 heads of 128); OUT rows of 4096 floats.  grid (32, ceil(n/64)),
+// threads 256, 32768 bytes shared: K and V 16 KB, 2 KB a simdgroup.
 #define XA_D 128
 #define XA_KB 32
+#define XA_SG 8
 kernel void x_attend_h(constant x_attn_args & a [[buffer(0)]],
                        device const half * q [[buffer(1)]], device const half * kc [[buffer(2)]],
                        device const half * vc [[buffer(3)]], device float * out [[buffer(4)]],
                        threadgroup char * shmem [[threadgroup(0)]],
                        uint2 tgp [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
                        ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
-    const uint h = tgp.x, tq0 = tgp.y * 32, t0 = tq0 + sg * 8;
+    const uint h = tgp.x, tq0 = tgp.y * 8 * XA_SG, t0 = tq0 + sg * 8;
     threadgroup half * ks = (threadgroup half *)shmem;                  // 32 x 128
     threadgroup half * vs = ks + XA_KB * XA_D;                          // 32 x 128
-    threadgroup char * mine = shmem + 2 * XA_KB * XA_D * 2 + sg * 4096; // this simdgroup's 4 KB
+    threadgroup char * mine = shmem + 2 * XA_KB * XA_D * 2 + sg * 2048; // this simdgroup's 2 KB
     threadgroup float * ss = (threadgroup float *)mine;                 // 8 x 32: S
     threadgroup float * dg = ss + 8 * XA_KB;                            // 8 x 8: a diagonal
     threadgroup half * ps = (threadgroup half *)(dg + 64);              // 8 x 32: P
-    threadgroup float * st = (threadgroup float *)mine;                 // 8 x 128 at the end: O
 
-    // Q's 8 rows, each 128 as sixteen 8 x 8 blocks (a row past N repeats N-1's: computed, never stored)
+    // Q's 8 rows as sixteen 8 x 8 blocks (a row past N repeats N-1's: computed, never stored)
     simdgroup_half8x8 qm[XA_D / 8];
     {
-        const uint r = min(t0, a.n - 1);
-        device const half * qp = q + (ulong)r * 4096 + h * XA_D;
-        // rows past N-1 read N-1's row: load row by row through threadgroup memory
-        threadgroup half * qs = (threadgroup half *)mine;              // 8 x 128 halves = 2 KB
+        threadgroup half * qs = (threadgroup half *)mine;              // 8 x 128 halves: 2 KB
         for (uint i = lane; i < 8 * XA_D; i += 32) {
             const uint rr = min(t0 + i / XA_D, a.n - 1);
             qs[i] = q[(ulong)rr * 4096 + h * XA_D + (i % XA_D)];
@@ -190,7 +189,6 @@ kernel void x_attend_h(constant x_attn_args & a [[buffer(0)]],
         simdgroup_barrier(mem_flags::mem_threadgroup);
         for (short c = 0; c < XA_D / 8; ++c) simdgroup_load(qm[c], qs + c * 8, XA_D);
         simdgroup_barrier(mem_flags::mem_threadgroup);
-        (void)qp;
     }
     for (uint i = lane; i < 64; i += 32) dg[i] = 0.f;
 
@@ -200,13 +198,13 @@ kernel void x_attend_h(constant x_attn_args & a [[buffer(0)]],
     const uint r = lane / 4, part = lane % 4;                           // this lane's row, its 8 keys of a step
     const bool live = t0 + r < a.n;
     const uint lim = x_lim(a.q0 + min(t0 + r, a.n - 1), a.p, a.l, a.b0, a.b1);
-    const uint last = x_lim(a.q0 + min(tq0 + 31, a.n - 1), a.p, a.l, a.b0, a.b1);
+    const uint last = x_lim(a.q0 + min(tq0 + 8 * XA_SG - 1, a.n - 1), a.p, a.l, a.b0, a.b1);
     float m = -INFINITY, lsum = 0.f;
 
     for (uint kb = 0; kb <= last; kb += XA_KB) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        // the step's keys and values: 32 x 128 halves each, 8 halves a thread at a time
-        for (uint i = tid; i < XA_KB * XA_D / 8; i += 128) {
+        // the step's keys and values: 32 x 128 halves each, 8 halves at a time (two a thread)
+        for (uint i = tid; i < XA_KB * XA_D / 8; i += 8 * 32 * XA_SG / 8) {
             const uint key = i / (XA_D / 8), c = (i % (XA_D / 8)) * 8, kp = kb + key;
             half4 k0 = half4(0.h), k1 = half4(0.h), v0 = half4(0.h), v1 = half4(0.h);
             if (kp < a.l) {
@@ -264,10 +262,12 @@ kernel void x_attend_h(constant x_attn_args & a [[buffer(0)]],
         if (part == 0) dg[r * 8 + r] = f;
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
-        // O = diag(f) O + P V
-        simdgroup_float8x8 dm;
-        simdgroup_load(dm, dg, 8);
-        for (short c = 0; c < XA_D / 8; ++c) simdgroup_multiply(o[c], dm, o[c]);
+        // O = diag(f) O + P V; the rescaling (float products, slow) only when a row's maximum moved
+        if (simd_any(f != 1.f)) {
+            simdgroup_float8x8 dm;
+            simdgroup_load(dm, dg, 8);
+            for (short c = 0; c < XA_D / 8; ++c) simdgroup_multiply(o[c], dm, o[c]);
+        }
         for (short kk = 0; kk < XA_KB / 8; ++kk) {
             simdgroup_half8x8 pm;
             simdgroup_load(pm, ps + kk * 8, XA_KB);
@@ -279,24 +279,27 @@ kernel void x_attend_h(constant x_attn_args & a [[buffer(0)]],
         }
     }
 
-    // O / L, through threadgroup memory to the rows that exist
+    // O / L: straight to memory when all 8 rows exist, else 64 columns at a time through this simdgroup's 2 KB
     simdgroup_barrier(mem_flags::mem_threadgroup);
     if (part == 0) dg[r * 8 + r] = lsum > 0.f ? 1.f / lsum : 0.f;
     simdgroup_barrier(mem_flags::mem_threadgroup);
     simdgroup_float8x8 dm;
     simdgroup_load(dm, dg, 8);
-    threadgroup_barrier(mem_flags::mem_threadgroup);     // the last step's K and V no longer read
-    threadgroup float * stage = (threadgroup float *)shmem + sg * 8 * XA_D;   // 4 KB a simdgroup, over K and V
-    for (short c = 0; c < XA_D / 8; ++c) {
-        simdgroup_multiply(o[c], dm, o[c]);
-        simdgroup_store(o[c], stage + c * 8, XA_D);
+    for (short c = 0; c < XA_D / 8; ++c) simdgroup_multiply(o[c], dm, o[c]);
+    if (t0 + 8 <= a.n) {
+        for (short c = 0; c < XA_D / 8; ++c) simdgroup_store(o[c], out + (ulong)t0 * 4096 + h * XA_D + c * 8, 4096);
+    } else if (t0 < a.n) {
+        threadgroup float * stage = (threadgroup float *)mine;          // 8 x 64 floats
+        for (short half_ = 0; half_ < 2; ++half_) {
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (short c = 0; c < 8; ++c) simdgroup_store(o[half_ * 8 + c], stage + c * 8, 64);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint i = lane; i < 8 * 64; i += 32) {
+                const uint rr = t0 + i / 64;
+                if (rr < a.n) out[(ulong)rr * 4096 + h * XA_D + half_ * 64 + (i % 64)] = stage[i];
+            }
+        }
     }
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = lane; i < 8 * XA_D; i += 32) {
-        const uint rr = t0 + i / XA_D;
-        if (rr < a.n) out[(ulong)rr * 4096 + h * XA_D + (i % XA_D)] = stage[i];
-    }
-    (void)st;
 }
 
 // --- the decoder ------------------------------------------------------------------
@@ -470,3 +473,70 @@ kernel void x_copy(constant x_n_args & a [[buffer(0)]], device const uint * src 
                    device uint * dst [[buffer(2)]], uint i [[thread_position_in_grid]]) {
     if (i < a.count) dst[i] = src[i];
 }
+
+// x_conv on the half simdgroup matrices (an implicit product): a threadgroup
+// 64 pixels by 64 output channels, its four simdgroups 32 x 32 each, K taken
+// NK at a time -- within one tap, since CIN is a multiple of NK (and K, for
+// a product, too) -- the inputs and weights gathered as halves into
+// threadgroup memory, sums in floats.  Same arguments as x_conv.
+// grid (ceil(pixels/64), ceil(cout/64)), threads 128, 16384 bytes shared.
+template <short NK>
+kernel void x_conv_h(constant x_conv_args & a [[buffer(0)]], device const float * wt [[buffer(1)]],
+                     device const float * bias [[buffer(2)]], device const float * x [[buffer(3)]],
+                     device float * y [[buffer(4)]], threadgroup char * shmem [[threadgroup(0)]],
+                     uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+                     ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup half * sa = (threadgroup half *)shmem;          // 64 pixels x NK
+    threadgroup half * sb = sa + 64 * NK;                       // 64 channels x NK
+    threadgroup float * stage = (threadgroup float *)shmem;     // 64 x 64 at the end
+    const uint ow = a.stride == 2 ? a.w / 2 : a.w, oh = a.stride == 2 ? a.h / 2 : a.h;
+    const uint n = oh * ow, ncols = a.taps * a.cin;
+    const uint t0 = tg.x * 64, r0 = tg.y * 64;
+    constexpr short PER = NK / 2;                               // halves a thread loads of a row: 2 threads a row
+    const ushort lr = tid / 2, lk = (tid % 2) * PER;
+    const uint pix = t0 + lr, py = pix / ow, px = pix - py * ow;
+    const ushort pb = (sg % 2) * 32, cb = (sg / 2) * 32;
+    simdgroup_float8x8 mc[16];
+    for (short i = 0; i < 16; ++i) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    for (uint k0 = 0; k0 < ncols; k0 += NK) {
+        const uint tap = k0 / a.cin, ci = k0 - tap * a.cin + lk;
+        int sy, sx;
+        if (a.taps == 1) { sy = py; sx = px; }
+        else if (a.stride == 2) { sy = 2 * py + tap / 3; sx = 2 * px + tap % 3; }
+        else { sy = (int)py + (int)(tap / 3) - 1; sx = (int)px + (int)(tap % 3) - 1; }
+        const bool ok = pix < n && sy >= 0 && sy < (int)a.h && sx >= 0 && sx < (int)a.w;
+        // (no address formed for a pixel of the padding or a channel past COUT)
+        if (ok) {
+            device const float4 * xp = (device const float4 *)(x + ((ulong)sy * a.w + sx) * a.ldx + ci);
+            for (short j = 0; j < PER / 4; ++j) *(threadgroup half4 *)(sa + lr * NK + lk + 4 * j) = half4(xp[j]);
+        } else {
+            for (short j = 0; j < PER / 4; ++j) *(threadgroup half4 *)(sa + lr * NK + lk + 4 * j) = half4(0.h);
+        }
+        if (r0 + lr < a.cout) {
+            device const float4 * wp = (device const float4 *)(wt + (ulong)(r0 + lr) * ncols + k0 + lk);
+            for (short j = 0; j < PER / 4; ++j) *(threadgroup half4 *)(sb + lr * NK + lk + 4 * j) = half4(wp[j]);
+        } else {
+            for (short j = 0; j < PER / 4; ++j) *(threadgroup half4 *)(sb + lr * NK + lk + 4 * j) = half4(0.h);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (short kk = 0; kk < NK / 8; ++kk) {
+            simdgroup_half8x8 ma[4], mb[4];
+            for (short i = 0; i < 4; ++i) simdgroup_load(ma[i], sa + (pb + 8 * i) * NK + kk * 8, NK);
+            for (short j = 0; j < 4; ++j) simdgroup_load(mb[j], sb + (cb + 8 * j) * NK + kk * 8, NK, 0, true);
+            for (short i = 0; i < 4; ++i)
+                for (short j = 0; j < 4; ++j) simdgroup_multiply_accumulate(mc[4 * i + j], ma[i], mb[j], mc[4 * i + j]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (short i = 0; i < 4; ++i)
+        for (short j = 0; j < 4; ++j) simdgroup_store(mc[4 * i + j], stage + (pb + 8 * i) * 64 + cb + 8 * j, 64);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = tid; e < 64 * 64; e += 128) {
+        const uint t = t0 + e / 64, r = r0 + e % 64;
+        if (t < n && r < a.cout) y[(ulong)t * a.ldy + r] = stage[e] + (a.has_bias ? bias[r] : 0.f);
+    }
+}
+
+typedef decltype(x_conv_h<16>) x_conv_h_t;
+template [[host_name("x_conv_h16")]] kernel x_conv_h_t x_conv_h<16>;
+template [[host_name("x_conv_h32")]] kernel x_conv_h_t x_conv_h<32>;

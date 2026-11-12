@@ -35,7 +35,7 @@
          (q (as-half (rnd (* n wd) 2.0))) (k (as-half (rnd (* l wd) 2.0))) (v (as-half (rnd (* l wd))))
          (qb (half-buffer gpu q)) (kb (half-buffer gpu k)) (vb (half-buffer gpu v))
          (ob (il::gpu-buffer gpu (* 4 n wd))) (err 0d0))
-    (run "x_attend_h" (list n q0 p l b0 b1 scale) (list qb kb vb ob) (list 32 (ceiling n 32)) 128 :shared 32768)
+    (run "x_attend_h" (list n q0 p l b0 b1 scale) (list qb kb vb ob) (list 32 (ceiling n 64)) 256 :shared 32768)
     (let ((out (get-floats ob (* n wd))))
       (dolist (h '(0 7 31))
         (dotimes (tq n)
@@ -53,14 +53,14 @@
 
 ;;; --- convolutions ---------------------------------------------------------------
 
-(defun test-conv (name cin cout hh ww taps stride)
+(defun test-conv (name cin cout hh ww taps stride &key (kernel "x_conv") (threads 256) (shared 0) (bound 1d-5))
   (let* ((gpu (exn-gpu)) (oh (if (= stride 2) (floor hh 2) hh)) (ow (if (= stride 2) (floor ww 2) ww))
          (wt (rnd (* cout taps cin))) (bias (rnd cout)) (x (rnd (* hh ww cin)))
          (yb (il::gpu-buffer gpu (* 4 oh ow cout))) (err 0d0) (size 0d0))
-    (run "x_conv" (list cin cout hh ww taps stride cin cout 1)
+    (run kernel (list cin cout hh ww taps stride cin cout 1)
          (list (put-floats (il::gpu-buffer gpu (* 4 (length wt))) wt) (put-floats (il::gpu-buffer gpu (* 4 cout)) bias)
                (put-floats (il::gpu-buffer gpu (* 4 (length x))) x) yb)
-         (list (ceiling (* oh ow) 64) (ceiling cout 64)) 256)
+         (list (ceiling (* oh ow) 64) (ceiling cout 64)) threads :shared shared)
     (let ((y (get-floats yb (* oh ow cout))))
       (dotimes (py oh)
         (dotimes (px ow)
@@ -77,7 +77,7 @@
                                     (aref x (+ (* (+ (* sy ww) sx) cin) ci))))))))
               (setf size (max size (abs want))
                     err (max err (abs (- want (aref y (+ (* (+ (* py ow) px) cout) r))))))))))
-      (check name (/ err size) 1d-5))))
+      (check name (/ err size) bound))))
 
 ;;; --- the reductions: norms and softmax -----------------------------------------------
 
@@ -147,6 +147,10 @@
 (test-conv "conv 3x3" 32 48 7 9 9 1)
 (test-conv "conv 3x3, stride 2" 16 70 8 10 9 2)
 (test-conv "conv 1x1 (a product)" 40 33 5 13 1 1)
+;; the half kernels: inputs and weights rounded to halves (about 1e-3 of a sum's size)
+(test-conv "conv 3x3, halves (K 32 a step)" 64 70 7 9 9 1 :kernel "x_conv_h32" :threads 128 :shared 16384 :bound 3d-3)
+(test-conv "conv 3x3 stride 2, halves (K 16)" 16 70 8 10 9 2 :kernel "x_conv_h16" :threads 128 :shared 16384 :bound 3d-3)
+(test-conv "conv 1x1, halves (K 16)" 48 33 5 13 1 1 :kernel "x_conv_h16" :threads 128 :shared 16384 :bound 3d-3)
 
 (format t "~:[~D FAILED~;all passed~*~]~%" (zerop *failures*) *failures*)
 (sb-ext:exit :code (if (zerop *failures*) 0 1))

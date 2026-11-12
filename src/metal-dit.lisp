@@ -235,7 +235,7 @@
                        (copy-words d e kh (car pre) (* p (floor wd 2)))
                        (copy-words d e vh (cdr pre) (* p (floor wd 2)))))
                 (il::dispatch gpu e "x_attend_h" (list n n0 p l a (+ a nref) (coerce (/ (sqrt 128d0)) 'single-float))
-                              (list qh kh vh att) (list 32 (ceiling n 32)) 128 :shared 32768)
+                              (list qh kh vh att) (list 32 (ceiling n 64)) 256 :shared 32768)
                 (mm d e (blk "attn.to_out.0.weight") att hh n)
                 (elementwise d e "x_gate_add" (* n wd) (list wd n0 p (* 4 wd)) (list x hh (piece 1)))
                 (il::dispatch gpu e "x_ln_mod" (list wd n n0 p (* 4 wd)) (list x (piece 2) y) n 256)
